@@ -14,7 +14,8 @@
  */
 
 import { sql } from 'drizzle-orm';
-import { jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { index, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import type { AnyPgColumn } from 'drizzle-orm/pg-core';
 
 /** Where a work item was materialized from. */
 export type WorkItemSource = 'github-issue' | 'github-pr' | 'linear-issue' | 'manual';
@@ -56,6 +57,10 @@ export const workItems = pgTable(
     source: text('source').notNull(),
     /** Dedupe key (e.g. 'github-issue:123', 'linear:ENG-42'); null for manual cards. */
     sourceKey: text('source_key'),
+    /** Optional originating issue item for a separate PR review item. */
+    parentWorkItemId: uuid('parent_work_item_id').references((): AnyPgColumn => workItems.id, {
+      onDelete: 'set null',
+    }),
     title: text('title').notNull(),
     /** External link (issue/PR); null for manual cards. */
     url: text('url'),
@@ -76,6 +81,7 @@ export const workItems = pgTable(
     uniqueIndex('work_items_project_source_key_unique')
       .on(table.githubProjectId, table.sourceKey)
       .where(sql`source_key IS NOT NULL`),
+    index('work_items_project_parent_idx').on(table.orgId, table.githubProjectId, table.parentWorkItemId),
   ],
 );
 
@@ -95,6 +101,7 @@ CREATE TABLE IF NOT EXISTS work_items (
   github_project_id uuid NOT NULL,
   source text NOT NULL,
   source_key text,
+  parent_work_item_id uuid,
   title text NOT NULL,
   url text,
   stages jsonb NOT NULL,
@@ -105,7 +112,24 @@ CREATE TABLE IF NOT EXISTS work_items (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+ALTER TABLE work_items
+  ADD COLUMN IF NOT EXISTS parent_work_item_id uuid;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'work_items_parent_work_item_id_fkey'
+  ) THEN
+    ALTER TABLE work_items
+      ADD CONSTRAINT work_items_parent_work_item_id_fkey
+      FOREIGN KEY (parent_work_item_id) REFERENCES work_items(id) ON DELETE SET NULL;
+  END IF;
+END $$;
+
 CREATE UNIQUE INDEX IF NOT EXISTS work_items_project_source_key_unique
   ON work_items (github_project_id, source_key)
   WHERE source_key IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS work_items_project_parent_idx
+  ON work_items (org_id, github_project_id, parent_work_item_id);
 `;

@@ -7,7 +7,7 @@
  * never drift from `stages`.
  */
 
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 
 import { getAppDb } from '../github/db';
@@ -37,6 +37,7 @@ export interface WorkItemSessionInput {
 export interface CreateWorkItemInput {
   source: WorkItemSource;
   sourceKey: string | null;
+  parentWorkItemId?: string | null;
   title: string;
   url: string | null;
   stages: string[];
@@ -45,6 +46,7 @@ export interface CreateWorkItemInput {
 }
 
 export interface UpdateWorkItemInput {
+  parentWorkItemId?: string | null;
   title?: string;
   url?: string | null;
   stages?: string[];
@@ -90,6 +92,14 @@ function sanitizeSourceKey(value: unknown): string | null | undefined {
   return value;
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function sanitizeParentWorkItemId(value: unknown): string | null | undefined {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'string' || !UUID_RE.test(value)) return undefined;
+  return value;
+}
+
 /** Role-keyed session refs with bounded string fields, or `undefined` when invalid. */
 function sanitizeSessions(value: unknown): Record<string, WorkItemSessionInput> | undefined {
   if (value === undefined) return {};
@@ -128,14 +138,25 @@ export function parseCreateWorkItem(body: unknown): CreateWorkItemInput | null {
   if (typeof source !== 'string' || !WORK_ITEM_SOURCES.includes(source as WorkItemSource)) return null;
 
   const sourceKey = sanitizeSourceKey(body.sourceKey);
+  const hasParentWorkItemId = 'parentWorkItemId' in body;
+  const parentWorkItemId = hasParentWorkItemId ? sanitizeParentWorkItemId(body.parentWorkItemId) : undefined;
   const title = sanitizeTitle(body.title);
   const url = sanitizeUrl(body.url);
   const stages = sanitizeStages(body.stages);
   const sessions = sanitizeSessions(body.sessions);
   const metadata = sanitizeMetadata(body.metadata);
-  if (sourceKey === undefined || !title || url === undefined || !stages || !sessions || !metadata) return null;
+  if (
+    sourceKey === undefined ||
+    (hasParentWorkItemId && parentWorkItemId === undefined) ||
+    !title ||
+    url === undefined ||
+    !stages ||
+    !sessions ||
+    !metadata
+  )
+    return null;
 
-  return { source: source as WorkItemSource, sourceKey, title, url, stages, sessions, metadata };
+  return { source: source as WorkItemSource, sourceKey, parentWorkItemId, title, url, stages, sessions, metadata };
 }
 
 /** Validate an untrusted PATCH body into an {@link UpdateWorkItemInput}, or `null`. */
@@ -143,6 +164,11 @@ export function parseUpdateWorkItem(body: unknown): UpdateWorkItemInput | null {
   if (!isPlainObject(body)) return null;
   const patch: UpdateWorkItemInput = {};
 
+  if ('parentWorkItemId' in body) {
+    const parentWorkItemId = sanitizeParentWorkItemId(body.parentWorkItemId);
+    if (parentWorkItemId === undefined) return null;
+    patch.parentWorkItemId = parentWorkItemId;
+  }
   if ('title' in body) {
     const title = sanitizeTitle(body.title);
     if (!title) return null;
@@ -213,6 +239,44 @@ function stampSessions(sessions: Record<string, WorkItemSessionInput>, by: strin
   return stamped;
 }
 
+export class WorkItemRelationError extends Error {
+  readonly code = 'invalid_work_item_relation';
+}
+
+function validateParentRelation(
+  projectItems: WorkItemRow[],
+  itemId: string | undefined,
+  parentWorkItemId: string | null,
+): void {
+  if (parentWorkItemId === null) return;
+  const byId = new Map(projectItems.map(item => [item.id, item]));
+  const parent = byId.get(parentWorkItemId);
+  if (!parent) throw new WorkItemRelationError('Related work item not found in this project.');
+  if (itemId === parentWorkItemId) throw new WorkItemRelationError('A work item cannot relate to itself.');
+
+  const visited = new Set<string>();
+  let cursor: WorkItemRow | undefined = parent;
+  while (cursor?.parentWorkItemId) {
+    if (cursor.parentWorkItemId === itemId) {
+      throw new WorkItemRelationError('This relationship would create a cycle.');
+    }
+    if (visited.has(cursor.id)) throw new WorkItemRelationError('The related work item chain contains a cycle.');
+    visited.add(cursor.id);
+    cursor = byId.get(cursor.parentWorkItemId);
+  }
+}
+
+async function lockProjectRelations(tx: DbTx, orgId: string, githubProjectId: string): Promise<void> {
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`${orgId}:${githubProjectId}`}))`);
+}
+
+async function projectWorkItems(db: AppDb | DbTx, orgId: string, githubProjectId: string): Promise<WorkItemRow[]> {
+  return db
+    .select()
+    .from(workItems)
+    .where(and(eq(workItems.orgId, orgId), eq(workItems.githubProjectId, githubProjectId)));
+}
+
 /** List the org's work items for a project, newest first. */
 export async function listWorkItems(orgId: string, githubProjectId: string): Promise<WorkItemRow[]> {
   const rows = await getAppDb()
@@ -246,11 +310,16 @@ export async function upsertWorkItem(params: {
 
   const reuseExisting = async (): Promise<UpsertWorkItemResult | null> => {
     if (input.sourceKey === null) return null;
+    const update = input.parentWorkItemId === null ? { ...input, parentWorkItemId: undefined } : input;
     const updated = await getAppDb().transaction(tx =>
       applyUpdateLocked(
         tx,
-        and(eq(workItems.githubProjectId, githubProjectId), eq(workItems.sourceKey, input.sourceKey!)),
-        input,
+        and(
+          eq(workItems.orgId, orgId),
+          eq(workItems.githubProjectId, githubProjectId),
+          eq(workItems.sourceKey, input.sourceKey!),
+        ),
+        update,
         userId,
         now,
       ),
@@ -267,6 +336,7 @@ export async function upsertWorkItem(params: {
     githubProjectId,
     source: input.source,
     sourceKey: input.sourceKey,
+    parentWorkItemId: input.parentWorkItemId ?? null,
     title: input.title,
     url: input.url,
     stages: input.stages,
@@ -276,10 +346,19 @@ export async function upsertWorkItem(params: {
     createdAt: now,
     updatedAt: now,
   };
+  const parentWorkItemId = input.parentWorkItemId;
 
   try {
-    const [inserted] = await getAppDb().insert(workItems).values(row).returning();
-    return { created: true, item: inserted! };
+    if (parentWorkItemId == null) {
+      const [inserted] = await getAppDb().insert(workItems).values(row).returning();
+      return { created: true, item: inserted! };
+    }
+    return await getAppDb().transaction(async tx => {
+      await lockProjectRelations(tx, orgId, githubProjectId);
+      validateParentRelation(await projectWorkItems(tx, orgId, githubProjectId), undefined, parentWorkItemId);
+      const [inserted] = await tx.insert(workItems).values(row).returning();
+      return { created: true, item: inserted! };
+    });
   } catch (err) {
     // Concurrent create for the same sourceKey: the partial unique index won
     // the race — fall back to updating the row it protected.
@@ -312,13 +391,26 @@ async function applyUpdateLocked(
   userId: string,
   now: Date,
 ): Promise<{ item: WorkItemRow; previous: WorkItemPriorState } | null> {
-  const [existing] = await tx.select().from(workItems).where(where).for('update');
+  let existing: WorkItemRow | undefined;
+  if (patch.parentWorkItemId === undefined) {
+    [existing] = await tx.select().from(workItems).where(where).for('update');
+  } else {
+    const [candidate] = await tx.select().from(workItems).where(where);
+    if (!candidate) return null;
+    await lockProjectRelations(tx, candidate.orgId, candidate.githubProjectId);
+    [existing] = await tx.select().from(workItems).where(eq(workItems.id, candidate.id)).for('update');
+  }
   if (!existing) return null;
   const previous: WorkItemPriorState = {
     stages: [...existing.stages],
     sessionRoles: Object.keys(existing.sessions),
   };
   const set: Partial<WorkItemRow> = { updatedAt: now };
+  if (patch.parentWorkItemId !== undefined) {
+    const items = await projectWorkItems(tx, existing.orgId, existing.githubProjectId);
+    validateParentRelation(items, existing.id, patch.parentWorkItemId);
+    set.parentWorkItemId = patch.parentWorkItemId;
+  }
   if (patch.title !== undefined) set.title = patch.title;
   if (patch.url !== undefined) set.url = patch.url;
   if (patch.stages !== undefined) {
@@ -352,11 +444,21 @@ export async function updateWorkItem(
   );
 }
 
-/** Delete an org's work item. Returns the row actually deleted, or `null` when it doesn't exist in the org. */
+/** Delete an org's work item. Children remain independent and lose only their parent relation. */
 export async function deleteWorkItem(orgId: string, id: string): Promise<WorkItemRow | null> {
-  const [deleted] = await getAppDb()
-    .delete(workItems)
-    .where(and(eq(workItems.id, id), eq(workItems.orgId, orgId)))
-    .returning();
-  return deleted ?? null;
+  return getAppDb().transaction(async tx => {
+    const [existing] = await tx
+      .select()
+      .from(workItems)
+      .where(and(eq(workItems.id, id), eq(workItems.orgId, orgId)))
+      .for('update');
+    if (!existing) return null;
+    await tx
+      .update(workItems)
+      .set({ parentWorkItemId: null, updatedAt: new Date() })
+      .where(and(eq(workItems.orgId, orgId), eq(workItems.parentWorkItemId, id)))
+      .returning();
+    const [deleted] = await tx.delete(workItems).where(eq(workItems.id, id)).returning();
+    return deleted ?? existing;
+  });
 }

@@ -44,6 +44,7 @@ function rowsOf(table: any): Array<Record<string, any>> {
 // Serialize transactions the way row locks would: each `db.transaction` waits
 // for the previous one to finish, so a locked read always sees prior writes.
 let txTail: Promise<unknown> = Promise.resolve();
+let advisoryLockCalls = 0;
 
 // Capture audit events at the store boundary so the real `emitAudit` path
 // (actor resolution, request context, never-throws) is exercised end to end.
@@ -131,6 +132,9 @@ vi.mock('../github/db', () => {
         },
       }),
     }),
+    execute: async () => {
+      advisoryLockCalls++;
+    },
     transaction: (fn: (tx: any) => Promise<unknown>) => {
       const run = txTail.then(() => fn(makeDbClient()));
       txTail = run.catch(() => undefined);
@@ -142,6 +146,7 @@ vi.mock('../github/db', () => {
 
 import { mountApiRoutes } from '../test-utils';
 import { buildFactoryRoutes } from './routes';
+import { FACTORY_MIGRATION_SQL } from './schema';
 import { parseCreateWorkItem, parseUpdateWorkItem } from './store';
 
 // ── Test harness ─────────────────────────────────────────────────────────
@@ -183,6 +188,7 @@ beforeEach(() => {
   tables = {};
   nextId = 1;
   txTail = Promise.resolve();
+  advisoryLockCalls = 0;
   auditRecorded = [];
   auditFailure = undefined;
   seedProject();
@@ -402,6 +408,201 @@ describe('DELETE /web/factory/work-items/:id', () => {
     expect((await json('DELETE', `/web/factory/work-items/00000000-0000-4000-8000-000000000099`)).status).toBe(404);
   });
 });
+
+// ── Relations ────────────────────────────────────────────────────────────
+describe('work item relationships', () => {
+  async function create(overrides: Record<string, unknown> = {}) {
+    const res = await json('POST', `/web/factory/projects/${PROJECT_ID}/work-items`, createBody(overrides));
+    return { res, body: await res.json() };
+  }
+
+  it('relates a separate PR review item to an issue in the same org project', async () => {
+    const { body: parent } = await create();
+    const { res, body } = await create({
+      source: 'github-pr',
+      sourceKey: 'github-pr:7',
+      title: 'Review the login fix',
+      parentWorkItemId: parent.workItem.id,
+    });
+
+    expect(res.status).toBe(200);
+    expect(body.workItem).toMatchObject({
+      source: 'github-pr',
+      parentWorkItemId: parent.workItem.id,
+    });
+    expect(tables['work_items']).toHaveLength(2);
+  });
+
+  it('preserves an existing relation when a repeated source-key upsert omits or nulls the parent field', async () => {
+    const { body: parent } = await create({ sourceKey: 'github-issue:upsert-parent' });
+    const { body: child } = await create({
+      source: 'github-pr',
+      sourceKey: 'github-pr:upsert-child',
+      parentWorkItemId: parent.workItem.id,
+    });
+
+    const repeated = await create({
+      source: 'github-pr',
+      sourceKey: 'github-pr:upsert-child',
+      title: 'Updated review title',
+    });
+
+    expect(repeated.res.status).toBe(200);
+    expect(repeated.body.workItem).toMatchObject({
+      id: child.workItem.id,
+      parentWorkItemId: parent.workItem.id,
+      title: 'Updated review title',
+    });
+
+    const repeatedWithNull = await create({
+      source: 'github-pr',
+      sourceKey: 'github-pr:upsert-child',
+      parentWorkItemId: null,
+      title: 'Updated again',
+    });
+    expect(repeatedWithNull.body.workItem).toMatchObject({
+      id: child.workItem.id,
+      parentWorkItemId: parent.workItem.id,
+      title: 'Updated again',
+    });
+  });
+
+  it('attaches a relation when a repeated source-key upsert supplies a parent', async () => {
+    const { body: parent } = await create({ sourceKey: 'github-issue:late-parent' });
+    const { body: existing } = await create({
+      source: 'github-pr',
+      sourceKey: 'github-pr:late-child',
+      parentWorkItemId: null,
+    });
+
+    const related = await create({
+      source: 'github-pr',
+      sourceKey: 'github-pr:late-child',
+      parentWorkItemId: parent.workItem.id,
+    });
+
+    expect(related.body.workItem).toMatchObject({
+      id: existing.workItem.id,
+      parentWorkItemId: parent.workItem.id,
+    });
+  });
+
+  it('rejects missing, cross-project, and cross-org parents', async () => {
+    const missing = await create({
+      sourceKey: 'github-pr:missing',
+      parentWorkItemId: '00000000-0000-4000-8000-000000000099',
+    });
+    expect(missing.res.status).toBe(400);
+
+    const otherProjectId = '22222222-3333-4444-8555-666666666666';
+    seedProject('org1', otherProjectId);
+    const otherParentResponse = await json(
+      'POST',
+      `/web/factory/projects/${otherProjectId}/work-items`,
+      createBody({ sourceKey: 'github-issue:other-project' }),
+    );
+    const otherParent = (await otherParentResponse.json()).workItem;
+    const crossProject = await create({ sourceKey: 'github-pr:cross-project', parentWorkItemId: otherParent.id });
+    expect(crossProject.res.status).toBe(400);
+
+    const crossOrgId = '00000000-0000-4000-8000-000000000088';
+    (tables['work_items'] ??= []).push({
+      ...parentRow(crossOrgId),
+      orgId: 'org2',
+      githubProjectId: PROJECT_ID,
+    });
+    const crossOrg = await create({ sourceKey: 'github-pr:cross-org', parentWorkItemId: crossOrgId });
+    expect(crossOrg.res.status).toBe(400);
+  });
+
+  it('rejects self-relations and cycles while allowing the relation to be cleared', async () => {
+    const { body: first } = await create({ sourceKey: 'github-issue:first' });
+    const { body: second } = await create({
+      sourceKey: 'github-pr:second',
+      parentWorkItemId: first.workItem.id,
+    });
+
+    const self = await json('PATCH', `/web/factory/work-items/${first.workItem.id}`, {
+      parentWorkItemId: first.workItem.id,
+    });
+    expect(self.status).toBe(400);
+
+    const cycle = await json('PATCH', `/web/factory/work-items/${first.workItem.id}`, {
+      parentWorkItemId: second.workItem.id,
+    });
+    expect(cycle.status).toBe(400);
+
+    const cleared = await json('PATCH', `/web/factory/work-items/${second.workItem.id}`, {
+      parentWorkItemId: null,
+    });
+    expect(cleared.status).toBe(200);
+    expect((await cleared.json()).workItem.parentWorkItemId).toBeNull();
+  });
+
+  it('serializes concurrent reciprocal relation updates so only one can commit', async () => {
+    const { body: first } = await create({ sourceKey: 'github-issue:concurrent-first' });
+    const { body: second } = await create({ sourceKey: 'github-issue:concurrent-second' });
+
+    const results = await Promise.all([
+      json('PATCH', `/web/factory/work-items/${first.workItem.id}`, {
+        parentWorkItemId: second.workItem.id,
+      }),
+      json('PATCH', `/web/factory/work-items/${second.workItem.id}`, {
+        parentWorkItemId: first.workItem.id,
+      }),
+    ]);
+
+    expect(results.map(result => result.status).sort()).toEqual([200, 400]);
+    expect(advisoryLockCalls).toBe(2);
+    const firstRow = tables['work_items'].find(item => item.id === first.workItem.id);
+    const secondRow = tables['work_items'].find(item => item.id === second.workItem.id);
+    expect(firstRow?.parentWorkItemId === second.workItem.id && secondRow?.parentWorkItemId === first.workItem.id).toBe(
+      false,
+    );
+  });
+
+  it('keeps child and parent independent when either side is deleted', async () => {
+    const { body: parent } = await create({ sourceKey: 'github-issue:parent' });
+    const { body: child } = await create({
+      source: 'github-pr',
+      sourceKey: 'github-pr:child',
+      parentWorkItemId: parent.workItem.id,
+    });
+
+    expect((await json('DELETE', `/web/factory/work-items/${parent.workItem.id}`)).status).toBe(200);
+    const list = await json('GET', `/web/factory/projects/${PROJECT_ID}/work-items`);
+    const items = (await list.json()).workItems;
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ id: child.workItem.id, parentWorkItemId: null });
+  });
+
+  it('ships additive relation DDL, an ownership lookup index, and non-cascading parent deletion', () => {
+    expect(FACTORY_MIGRATION_SQL).toContain('ADD COLUMN IF NOT EXISTS parent_work_item_id uuid');
+    expect(FACTORY_MIGRATION_SQL).toContain('ON DELETE SET NULL');
+    expect(FACTORY_MIGRATION_SQL).toContain('ON work_items (org_id, github_project_id, parent_work_item_id)');
+  });
+});
+
+function parentRow(id: string) {
+  const now = new Date();
+  return {
+    id,
+    orgId: 'org1',
+    createdBy: 'u1',
+    githubProjectId: PROJECT_ID,
+    source: 'github-issue',
+    sourceKey: `github-issue:${id}`,
+    parentWorkItemId: null,
+    title: 'Parent',
+    url: null,
+    stages: ['intake'],
+    stageHistory: [],
+    sessions: {},
+    metadata: {},
+    createdAt: now,
+    updatedAt: now,
+  };
+}
 
 // ── Metrics ──────────────────────────────────────────────────────────────
 describe('GET /web/factory/projects/:id/metrics', () => {
