@@ -162,6 +162,7 @@ interface AppHandlerOptions {
   intakeConfig?: IntakeConfig;
   linearStatus?: LinearStatus;
   sessionThreadId?: string;
+  sessionThreadsByScope?: Record<string, string>;
 }
 
 function useAppHandlers(githubStatus: GithubStatus, options: AppHandlerOptions = {}) {
@@ -178,7 +179,9 @@ function useAppHandlers(githubStatus: GithubStatus, options: AppHandlerOptions =
     ),
     http.post(`${API}/sessions`, async ({ request }) => {
       const body = (await request.json()) as { sessionScope?: string };
-      boundThreadId = body.sessionScope ? 'thread-factory' : (options.sessionThreadId ?? THREAD_ID);
+      boundThreadId = body.sessionScope
+        ? (options.sessionThreadsByScope?.[body.sessionScope] ?? 'thread-factory')
+        : (options.sessionThreadId ?? THREAD_ID);
       return HttpResponse.json({ controllerId: 'code', resourceId: RESOURCE_ID, threadId: boundThreadId });
     }),
     http.get(`${API}/modes`, () => HttpResponse.json({ modes: [{ id: 'build', label: 'Build' }] })),
@@ -510,8 +513,8 @@ describe('Factory Work and Review intake candidates', () => {
         makeWorkItem({
           id: '00000000-0000-4000-8000-000000000042',
           title: 'Add factory pages',
-          source: 'github-pr',
-          sourceKey: 'github-pr:42',
+          source: 'github-issue',
+          sourceKey: 'github-issue:42',
           stages: ['review'],
         }),
       ],
@@ -554,8 +557,8 @@ describe('Factory Work and Review intake candidates', () => {
         makeWorkItem({
           id: '00000000-0000-4000-8000-000000000042',
           title: 'Add factory pages',
-          source: 'github-pr',
-          sourceKey: 'github-pr:42',
+          source: 'github-issue',
+          sourceKey: 'github-issue:42',
           stages: ['review'],
         }),
       ],
@@ -915,6 +918,10 @@ describe('Factory Board — persisted cards', () => {
       useBoardHandlers({ workItems: relatedWorkItems });
       const { router } = renderAt(`/threads/${initialThreadId}`, relatedProject, connectedStatus, {
         sessionThreadId: initialThreadId,
+        sessionThreadsByScope: {
+          [issueWorktreePath]: THREAD_ID,
+          [reviewWorktreePath]: 'thread-related-review',
+        },
       });
 
       await userEvent.click(await screen.findByRole('button', { name: buttonName }));
@@ -1034,7 +1041,9 @@ describe('Factory Board — persisted cards', () => {
         }),
       ],
     });
-    const { router } = renderAt('/factory/work', projectWithIssueWorktree);
+    const { router } = renderAt('/factory/work', projectWithIssueWorktree, connectedStatus, {
+      sessionThreadsByScope: { [issueWorktreePath]: 'thread-work' },
+    });
 
     await screen.findByTestId('board-column-intake');
     const card = within(column('execute')).getByTestId('work-item-card');
@@ -1723,7 +1732,7 @@ describe('Factory Board — investigate flow', () => {
     await userEvent.click(within(intake).getByRole('button', { name: 'Investigate Fix flaky test' }));
 
     expect(await screen.findByText('Skill not found: understand-issue.')).toBeInTheDocument();
-    expect(router.state.location.pathname).toBe('/factory/board');
+    expect(router.state.location.pathname).toBe('/factory/work');
     expect(captured.skillInvocations).toHaveLength(1);
     expect(captured.messages).toHaveLength(0);
     expect(state.posts).toHaveLength(0);
