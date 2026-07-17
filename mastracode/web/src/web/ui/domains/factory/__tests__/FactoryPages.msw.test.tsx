@@ -1390,7 +1390,7 @@ describe('Factory Board — persisted cards', () => {
     await waitFor(() => expect(router.state.location.pathname).toBe('/threads/thread-factory'));
     expect(captured.worktree).toMatchObject({ branch: 'factory/issue-12' });
     await waitFor(() => expect(captured.messages[0]!.message).toContain('Implement a fix for GitHub issue #12'));
-    expect(state.patches).toMatchObject([{ id: 'wi-1', stages: ['execute'] }]);
+    await waitFor(() => expect(state.patches).toMatchObject([{ id: 'wi-1', stages: ['execute'] }]));
   });
 
   it('given a card in Intake, when Mark done is chosen from the menu, then the stages PATCH to done and the card moves', async () => {
@@ -1635,6 +1635,7 @@ describe('Factory Board — investigate flow', () => {
     ]);
     expect(JSON.stringify(captured.skillInvocations)).not.toContain('Fix flaky test');
     // The run files a board record in the planning stage with the plan session ref.
+    await waitFor(() => expect(state.posts).toHaveLength(1));
     expect(state.posts).toMatchObject([
       {
         source: 'github-issue',
@@ -1681,7 +1682,10 @@ describe('Factory Board — investigate flow', () => {
       expect(pathWhenDispatched).toBe('/threads/thread-factory');
       expect(captured.skillInvocations).toHaveLength(1);
       expect(captured.messages[0]?.message).toContain('<skill name="understand-issue">');
+      expect(state.posts).toHaveLength(0);
+      releaseDispatch();
       await waitFor(() => expect(state.posts).toHaveLength(1));
+      expect(captured.messages).toHaveLength(1);
     } finally {
       releaseDispatch();
     }
@@ -1935,6 +1939,7 @@ describe('Factory Board — investigate flow', () => {
       arguments: expect.stringContaining('GitHub issue #12 (https://github.com/mastra-ai/mastra/issues/12)'),
     });
     expect(JSON.stringify(captured.skillInvocations)).not.toContain('Fix flaky test');
+    await waitFor(() => expect(state.patches).toHaveLength(1));
     expect(state.patches).toMatchObject([
       {
         id: 'wi-1',
