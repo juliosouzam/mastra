@@ -349,7 +349,7 @@ export class MastraFactory {
       workspace: getFactoryWorkspace,
       disableGithubSignals: true,
       ...(storage ? { storage } : {}),
-      ...(vector ? { vectorStore: vector } : {}),
+      ...(vector ? { vector } : {}),
       ...(toolIntegrations.length > 0
         ? {
             extraTools: async ({ requestContext }: { requestContext: RequestContext }) => {
