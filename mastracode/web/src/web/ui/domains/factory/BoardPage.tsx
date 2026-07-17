@@ -501,7 +501,7 @@ function Board({ project, kind }: { project: Project & { githubProjectId: string
   const navigate = useNavigate();
   const boardContainerRef = useRef<HTMLDivElement>(null);
   const laneRefs = useRef(new Map<BoardStageId, HTMLElement>());
-  const positionedProjectRef = useRef<string | undefined>(undefined);
+  const autoPositionedProjectRef = useRef<string | undefined>(undefined);
   const userPositionedProjectRef = useRef<string | undefined>(undefined);
 
   // Worktrees that still exist. A card's session ref whose worktree was
@@ -554,8 +554,8 @@ function Board({ project, kind }: { project: Project & { githubProjectId: string
     (activeIntakeSource === 'linear' && linearIssues.isPending);
 
   useEffect(() => {
-    if (boardDataPending || positionedProjectRef.current === project.id) return;
-    positionedProjectRef.current = project.id;
+    if (boardDataPending || autoPositionedProjectRef.current === project.id) return;
+    autoPositionedProjectRef.current = project.id;
     if (userPositionedProjectRef.current === project.id) return;
 
     const firstPopulatedStage = stages.find(
@@ -619,7 +619,8 @@ function Board({ project, kind }: { project: Project & { githubProjectId: string
           userPositionedProjectRef.current = project.id;
         }}
         onScroll={() => {
-          if (positionedProjectRef.current !== project.id) userPositionedProjectRef.current = project.id;
+          // Ignore the scroll event emitted by our own initial scrollTo call.
+          if (autoPositionedProjectRef.current !== project.id) userPositionedProjectRef.current = project.id;
         }}
       >
         {stages.map(stage => (
