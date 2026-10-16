@@ -512,8 +512,8 @@ describeIntegration('OracleVector integration', () => {
   // HNSW indexes live in Oracle's Vector Pool, sized by VECTOR_MEMORY_SIZE. The Docker container
   // in docker-compose.yaml only applies that setting after a `docker compose restart db` (see
   // scripts/configure-vector-memory.sql and the README's "Vector memory (HNSW only)" section), so
-  // this suite must stay green whether or not that restart has happened. Exact search and IVF are
-  // covered by the tests above and never depend on the Vector Pool.
+  // local runs can skip HNSW before that restart. CI requires HNSW so a green matrix entry proves
+  // that the supported database actually ran these tests. Exact search and IVF are independent.
   describe('HNSW vector index (requires Oracle Vector Pool memory)', () => {
     let hnswUnavailableReason: string | null = null;
 
@@ -549,6 +549,7 @@ describeIntegration('OracleVector integration', () => {
 
     it('builds an HNSW vector index once Oracle Vector Pool memory is configured', async context => {
       if (hnswUnavailableReason) {
+        if (process.env.ORACLE_REQUIRE_HNSW === 'true') throw new Error(hnswUnavailableReason);
         context.skip(hnswUnavailableReason);
       }
 
@@ -571,13 +572,14 @@ describeIntegration('OracleVector integration', () => {
             indexName,
             dimension: 3,
             metric: 'cosine',
-            indexConfig: { type: 'hnsw' },
+            indexConfig: { type: 'hnsw', hnsw: { neighbors: 8, efConstruction: 40 } },
           });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           // ORA-51962: Vector Pool out of space — surfaces when VECTOR_MEMORY_SIZE has not taken
           // effect yet (needs a restart after scripts/configure-vector-memory.sql runs).
           if (/VECTOR_MEMORY_SIZE|Vector Pool|ORA-51962/i.test(message)) {
+            if (process.env.ORACLE_REQUIRE_HNSW === 'true') throw error;
             context.skip(
               'Oracle Vector Pool is out of space (ORA-51962). Run `docker compose restart db` once ' +
                 'after the container finishes initializing to enable HNSW.',
@@ -600,12 +602,14 @@ describeIntegration('OracleVector integration', () => {
         await expect(vector.describeIndex({ indexName })).resolves.toMatchObject({
           indexType: 'hnsw',
           metric: 'cosine',
+          indexConfig: { hnsw: { neighbors: 8, efConstruction: 40 } },
         });
 
         const results = await vector.query({
           indexName,
           queryVector: [0.1, 0.2, 0.3],
           topK: 2,
+          ef: 64,
         });
 
         expect(results.map(result => result.id)).toContain('hnsw-1');

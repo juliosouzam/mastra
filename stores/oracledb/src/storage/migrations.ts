@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 
+import { isOracleErrorCode } from '../shared/connection';
 import type { ObjectRow } from '../shared/connection';
 import { normalizeIdentifier } from '../vector/identifiers';
 import type { OracleQueryBinds, OracleTxClient } from './db';
@@ -160,8 +161,9 @@ ORDER BY id`,
   private async record(migration: NormalizedOracleMigration): Promise<void> {
     await this.db.tx(async client => {
       // MERGE keeps the ledger accurate for both first application and repeatable re-application.
-      await client.none(
-        `MERGE INTO ${this.table()} target
+      const write = () =>
+        client.none(
+          `MERGE INTO ${this.table()} target
 USING (
   SELECT
     :id AS id,
@@ -180,14 +182,37 @@ WHEN MATCHED THEN UPDATE SET
   target.updated_at = SYSTIMESTAMP
 WHEN NOT MATCHED THEN INSERT (id, name, kind, checksum, description, applied_at, updated_at)
 VALUES (source.id, source.name, source.kind, source.checksum, source.description, SYSTIMESTAMP, SYSTIMESTAMP)`,
-        {
-          id: migration.id,
-          name: migration.name,
-          kind: migration.kind,
-          checksum: migration.checksum,
-          description: migration.description ?? null,
-        },
-      );
+          {
+            id: migration.id,
+            name: migration.name,
+            kind: migration.kind,
+            checksum: migration.checksum,
+            description: migration.description ?? null,
+          },
+        );
+      try {
+        await write();
+      } catch (error) {
+        if (!isOracleErrorCode(error, [-1])) throw error;
+        // Oracle MERGE can choose INSERT before another session commits the same
+        // key. Re-read the winner under a row lock before reconciling the ledger.
+        const winner = await client.one<{ kind: OracleMigrationKind; checksum: string }>(
+          `SELECT kind AS "kind", checksum AS "checksum" FROM ${this.table()} WHERE id = :id FOR UPDATE`,
+          { id: migration.id },
+        );
+        if (winner.kind !== migration.kind) {
+          throw new Error(
+            `Oracle migration ${migration.id} was already applied as ${winner.kind} and cannot be changed to ${migration.kind}.`,
+          );
+        }
+        if (winner.checksum === migration.checksum) return;
+        if (migration.kind === 'versioned') {
+          throw new Error(
+            `Oracle migration ${migration.id} was already applied with checksum ${winner.checksum}, but the current definition has checksum ${migration.checksum}. Add a new migration instead of changing an applied versioned migration.`,
+          );
+        }
+        await write();
+      }
     });
   }
 }

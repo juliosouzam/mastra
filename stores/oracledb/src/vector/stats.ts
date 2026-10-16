@@ -163,6 +163,7 @@ async function getIndexInfo(registry: IndexRegistry, connection: Connection, ind
 
   return {
     ...indexInfo,
+    indexConfig: indexInfo.indexConfig ? structuredClone(indexInfo.indexConfig) : undefined,
     count,
   };
 }

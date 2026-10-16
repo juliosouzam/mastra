@@ -1,4 +1,5 @@
 import { TABLE_MESSAGES, TABLE_SCHEMAS, TABLE_THREADS } from '@mastra/core/storage';
+import oracledb from 'oracledb';
 import { describe, expect, it, vi } from 'vitest';
 
 import { OracleDB } from '.';
@@ -327,9 +328,9 @@ describe('OracleDB facade', () => {
     const binds = connection.execute.mock.calls.map(call => call[1] as Record<string, unknown>);
     const bindValues = binds.flatMap(bind => Object.values(bind));
     expect(bindValues).toContain(null);
-    expect(bindValues.filter(value => value && typeof value === 'object' && 'type' in value)).toHaveLength(3);
+    expect(bindValues).toContainEqual({ type: oracledb.DB_TYPE_TIMESTAMP_TZ, val: now });
     expect(binds.some(bind => Object.values(bind).includes(1) && Object.values(bind).includes(0))).toBe(true);
-    expect(bindValues).toContain(now);
+    expect(bindValues).not.toContain(now);
 
     await expect(db.hasColumn(TABLE_THREADS, 'bad-column')).rejects.toThrow(/column name/i);
     await expect(db.insert({ tableName: TABLE_THREADS, record: { 'bad-column': 'bad' } })).rejects.toThrow(

@@ -8142,6 +8142,9 @@ importers:
       '@internal/types-builder':
         specifier: workspace:*
         version: link:../../packages/_types-builder
+      '@mastra/auth-better-auth':
+        specifier: workspace:*
+        version: link:../../auth/better-auth
       '@mastra/core':
         specifier: workspace:*
         version: link:../../packages/core
@@ -8149,14 +8152,17 @@ importers:
         specifier: 22.19.15
         version: 22.19.15
       '@types/oracledb':
-        specifier: 6.5.2
-        version: 6.5.2
+        specifier: 6.10.4
+        version: 6.10.4
       '@vitest/coverage-v8':
         specifier: 'catalog:'
         version: 4.1.11(vitest@4.1.11)
       '@vitest/ui':
         specifier: 'catalog:'
         version: 4.1.11(vitest@4.1.11)
+      better-auth:
+        specifier: ^1.7.7
+        version: 1.7.7(@opentelemetry/api@1.9.1)(drizzle-kit@0.31.10)(drizzle-orm@0.45.2(@cloudflare/workers-types@4.20260702.1)(@libsql/client@0.18.0(bufferutil@4.1.0))(@opentelemetry/api@1.9.1)(@types/pg@8.20.0)(@upstash/redis@1.38.0)(kysely@0.28.17)(mysql2@3.24.4(@types/node@22.19.15))(pg@8.22.0)(sql.js@1.14.1)(sqlite3@5.1.7(bluebird@3.7.2)(supports-color@10.2.2)))(mongodb@7.5.0(@aws-sdk/credential-providers@3.1104.0)(@mongodb-js/zstd@7.0.0)(socks@2.8.9))(mysql2@3.24.4(@types/node@22.19.15))(pg@8.22.0)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(vitest@4.1.11)
       eslint:
         specifier: ^10.4.1
         version: 10.7.0(jiti@2.7.0)(supports-color@10.2.2)
@@ -21375,8 +21381,8 @@ packages:
   '@types/node@22.19.15':
     resolution: {integrity: sha512-F0R/h2+dsy5wJAUe3tAU6oqa2qbWY5TpNfL/RGmo1y38hiyO1w3x2jPtt76wmuaJI4DQnOBu21cNXQ2STIUUWg==}
 
-  '@types/oracledb@6.5.2':
-    resolution: {integrity: sha512-kK1eBS/Adeyis+3OlBDMeQQuasIDLUYXsi2T15ccNJ0iyUpQ4xDF7svFu3+bGVrI0CMBUclPciz+lsQR3JX3TQ==}
+  '@types/oracledb@6.10.4':
+    resolution: {integrity: sha512-VztLwr8PQsStRD5MEr6FVRv9LN+JeeTrTGVUFenAmTP/8X+mfNYwz02qvMc8B41CVeDdR3enQhaWmT9iBgNJSA==}
 
   '@types/papaparse@5.5.2':
     resolution: {integrity: sha512-gFnFp/JMzLHCwRf7tQHrNnfhN4eYBVYYI897CGX4MY1tzY9l2aLkVyx2IlKZ/SAqDbB3I1AOZW5gTMGGsqWliA==}
@@ -45493,7 +45499,7 @@ snapshots:
     dependencies:
       undici-types: 6.21.0
 
-  '@types/oracledb@6.5.2':
+  '@types/oracledb@6.10.4':
     dependencies:
       '@types/node': 22.19.15
 

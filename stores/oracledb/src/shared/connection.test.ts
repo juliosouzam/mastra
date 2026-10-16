@@ -27,6 +27,20 @@ const password = process.env.ORACLE_DATABASE_PASSWORD ?? 'mastra_test_password';
 const connectString = process.env.ORACLE_DATABASE_CONNECT_STRING ?? 'localhost:1521/FREEPDB1';
 
 describe('Oracle shared connection helpers', () => {
+  it('identifies equal Knowledge backends without including credentials', () => {
+    const first = new OraclePoolManager({ user: 'mastra', password: 'first-secret', connectString: 'HOST/service' });
+    const second = new OraclePoolManager({
+      user: 'MASTRA',
+      password: 'second-secret',
+      connectString: '//host:1521/service',
+    });
+    expect(first.getStorageIsolationKey()).toBe(second.getStorageIsolationKey());
+    expect(first.getStorageIsolationKey('OTHER')).not.toBe(first.getStorageIsolationKey());
+    expect(first.getStorageIsolationKey()).not.toContain('secret');
+    expect(new OraclePoolManager({ pool: {} as any }).getStorageIsolationKey()).toBe(
+      'oracle:unidentified:schema:current',
+    );
+  });
   it('loads node-oracledb in its default Thin mode', () => {
     expect(oracledb.thin).toBe(true);
   });

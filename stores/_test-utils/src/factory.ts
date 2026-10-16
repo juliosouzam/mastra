@@ -37,6 +37,8 @@ export type TestCapabilities = {
   listScoresBySpan?: boolean;
   /** Whether scorer-based pagination is guaranteed to be ordered newest-first. */
   deterministicScorePagination?: boolean;
+  /** Whether caller-supplied score IDs upsert. Defaults to experiments domain availability. */
+  scoreUpsert?: boolean;
   /**
    * Whether the adapter persists item-level tool mocks and experiment tool mock
    * reports (defaults to true). Adapters that reject them (e.g. MySQL) set this
@@ -50,7 +52,7 @@ export type TestCapabilities = {
   /**
    * Whether late workflow-result writes preserve a deleted run. Concurrent adapters default to true;
    * adapters pending alignment under COR-1448 set this to false. Pending adapters are Convex, DSQL,
-   * DynamoDB, Elasticsearch, MongoDB, MSSQL, MySQL, OracleDB, Redis, Spanner, Upstash, and Valkey.
+   * DynamoDB, Elasticsearch, MongoDB, MSSQL, MySQL, Redis, Spanner, Upstash, and Valkey.
    */
   workflowResultsNoopWhenRunMissing?: boolean;
   /**

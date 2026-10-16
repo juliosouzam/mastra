@@ -207,7 +207,7 @@ export async function getObservationalMemoryHistory(
          ORDER BY ${OM_GENERATION_COUNT} ${direction}, ${OM_CREATED_AT} ASC, "id" ASC
          OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY`,
         asBindParameters({ offset: options?.offset ?? 0, ...binds }),
-        executeOptions(),
+        executeOptions(MEMORY_JSON_COLUMNS),
       );
       return rows(result).map(row => parseOMRow(row as ObservationalMemoryRow));
     });
@@ -552,9 +552,9 @@ export async function updateObservationalMemoryConfig(
       // Lock current config before deep-merging so concurrent observers do not
       // drop nested config keys written by another request.
       const result = await connection.execute<ObjectRow>(
-        `SELECT config AS "config" FROM ${table(ctx, TABLE_OBSERVATIONAL_MEMORY)} WHERE id = :id FOR UPDATE`,
+        `SELECT JSON_SERIALIZE(config RETURNING CLOB) AS "config" FROM ${table(ctx, TABLE_OBSERVATIONAL_MEMORY)} WHERE id = :id FOR UPDATE`,
         { id: input.id },
-        executeOptions(),
+        executeOptions(MEMORY_JSON_COLUMNS),
       );
       const row = rows(result)[0];
       if (!row) {
@@ -740,6 +740,14 @@ async function updateOMColumns(
   });
 }
 
+export const MEMORY_JSON_COLUMNS = [
+  'config',
+  'metadata',
+  'observedMessageIds',
+  'bufferedMessageIds',
+  'bufferedObservationChunks',
+];
+
 export function omSelect(): string {
   return `SELECT
     id AS "id",
@@ -750,7 +758,7 @@ export function omSelect(): string {
     ${OM_ACTIVE_OBSERVATIONS} AS "activeObservations",
     ${OM_ACTIVE_OBSERVATIONS_PENDING_UPDATE} AS "activeObservationsPendingUpdate",
     ${OM_ORIGIN_TYPE} AS "originType",
-    config AS "config",
+    JSON_SERIALIZE(config RETURNING CLOB) AS "config",
     ${OM_GENERATION_COUNT} AS "generationCount",
     ${OM_LAST_OBSERVED_AT} AS "lastObservedAt",
     ${OM_LAST_REFLECTION_AT} AS "lastReflectionAt",
@@ -759,21 +767,21 @@ export function omSelect(): string {
     ${OM_OBSERVATION_TOKEN_COUNT} AS "observationTokenCount",
     ${OM_IS_OBSERVING} AS "isObserving",
     ${OM_IS_REFLECTING} AS "isReflecting",
-    ${OM_OBSERVED_MESSAGE_IDS} AS "observedMessageIds",
+    JSON_SERIALIZE(${OM_OBSERVED_MESSAGE_IDS} RETURNING CLOB) AS "observedMessageIds",
     ${OM_OBSERVED_TIMEZONE} AS "observedTimezone",
     ${OM_BUFFERED_OBSERVATIONS} AS "bufferedObservations",
     ${OM_BUFFERED_OBSERVATION_TOKENS} AS "bufferedObservationTokens",
-    ${OM_BUFFERED_MESSAGE_IDS} AS "bufferedMessageIds",
+    JSON_SERIALIZE(${OM_BUFFERED_MESSAGE_IDS} RETURNING CLOB) AS "bufferedMessageIds",
     ${OM_BUFFERED_REFLECTION} AS "bufferedReflection",
     ${OM_BUFFERED_REFLECTION_TOKENS} AS "bufferedReflectionTokens",
     ${OM_BUFFERED_REFLECTION_INPUT_TOKENS} AS "bufferedReflectionInputTokens",
     ${OM_REFLECTED_OBSERVATION_LINE_COUNT} AS "reflectedObservationLineCount",
-    ${OM_BUFFERED_OBSERVATION_CHUNKS} AS "bufferedObservationChunks",
+    JSON_SERIALIZE(${OM_BUFFERED_OBSERVATION_CHUNKS} RETURNING CLOB) AS "bufferedObservationChunks",
     ${OM_IS_BUFFERING_OBSERVATION} AS "isBufferingObservation",
     ${OM_IS_BUFFERING_REFLECTION} AS "isBufferingReflection",
     ${OM_LAST_BUFFERED_AT_TOKENS} AS "lastBufferedAtTokens",
     ${OM_LAST_BUFFERED_AT_TIME} AS "lastBufferedAtTime",
-    metadata AS "metadata",
+    JSON_SERIALIZE(metadata RETURNING CLOB) AS "metadata",
     ${OM_SUPERSEDED_BY} AS "supersededBy",
     ${OM_CREATED_AT} AS "createdAt",
     ${OM_UPDATED_AT} AS "updatedAt"`;
@@ -828,7 +836,7 @@ async function getHeadOMRow(
      ORDER BY ${OM_HEAD_ORDER}
      FETCH FIRST 1 ROWS ONLY`,
     asBindParameters({ lookupKey }),
-    executeOptions(),
+    executeOptions(MEMORY_JSON_COLUMNS),
   );
   return rows(result)[0] as ObservationalMemoryRow | undefined;
 }
@@ -842,7 +850,7 @@ export async function findOMRowForUpdate(
   const result = await connection.execute<ObjectRow>(
     `${omSelect()} FROM ${table(ctx, TABLE_OBSERVATIONAL_MEMORY)} WHERE id = :id FOR UPDATE`,
     { id },
-    executeOptions(),
+    executeOptions(MEMORY_JSON_COLUMNS),
   );
   return rows(result)[0] as ObservationalMemoryRow | undefined;
 }

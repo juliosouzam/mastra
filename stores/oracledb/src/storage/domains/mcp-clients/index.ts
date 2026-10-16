@@ -22,10 +22,11 @@ import type {
 } from '@mastra/core/storage/domains/mcp-clients';
 
 import { jsonBind, nullableJsonBind, safeJsonValue } from '../../../shared/connection';
-import { assertJsonPath, indexNameForTable, qualifyName } from '../../../vector/identifiers';
+import { indexNameForTable, qualifyName } from '../../../vector/identifiers';
 import { OracleDB, createOracleIndex, filterIndexesForTables, parseOracleJson } from '../../db';
 import type { OracleCreateIndexOptions, OracleTxClient } from '../../db';
 import {
+  buildOracleJsonContains,
   createOracleStorageError,
   parseOptionalJsonObject,
   parseOptionalStringArray,
@@ -53,6 +54,7 @@ type MCPClientRow = {
   activeVersionId?: string | null;
   authorId?: string | null;
   metadata?: unknown;
+  metadataJson?: string | null;
   createdAt: Date | string;
   updatedAt: Date | string;
 };
@@ -82,7 +84,7 @@ export class MCPClientsOracle extends MCPClientsStorage {
 
   constructor(config: OracleDomainConfig) {
     super();
-    this.db = new OracleDB(config);
+    this.db = new OracleDB({ ...config, jsonColumns: ['servers', 'changedFields'] });
     this.schemaName = config.schemaName;
     this.skipDefaultIndexes = config.skipDefaultIndexes;
     this.indexes = filterIndexesForTables(config.indexes, MCPClientsOracle.MANAGED_TABLES);
@@ -112,8 +114,12 @@ export class MCPClientsOracle extends MCPClientsStorage {
   }
 
   async getById(id: string): Promise<StorageMCPClientType | null> {
+    return this.getByIdWithClient(this.db.read, id);
+  }
+
+  private async getByIdWithClient(client: OracleDB, id: string): Promise<StorageMCPClientType | null> {
     try {
-      const row = await this.db.oneOrNone<MCPClientRow>(
+      const row = await client.oneOrNone<MCPClientRow>(
         `${this.clientSelect()} FROM ${this.table(TABLE_MCP_CLIENTS)} WHERE id = :id`,
         { id },
       );
@@ -188,7 +194,7 @@ export class MCPClientsOracle extends MCPClientsStorage {
     const { id, ...updates } = input;
 
     try {
-      const existingClient = await this.getById(id);
+      const existingClient = await this.getByIdWithClient(this.db, id);
       if (!existingClient) {
         throw new Error(`MCP client with id ${id} not found`);
       }
@@ -225,7 +231,7 @@ export class MCPClientsOracle extends MCPClientsStorage {
 
       await this.db.none(`UPDATE ${this.table(TABLE_MCP_CLIENTS)} SET ${setClauses.join(', ')} WHERE id = :id`, binds);
 
-      const updatedClient = await this.getById(id);
+      const updatedClient = await this.getByIdWithClient(this.db, id);
       if (!updatedClient) {
         throw new Error(`MCP client with id ${id} not found after update`);
       }
@@ -265,7 +271,7 @@ export class MCPClientsOracle extends MCPClientsStorage {
       const { field, direction } = this.parseOrderBy(orderBy);
       const { whereClause, binds } = this.clientWhereClause({ status, authorId, metadata });
 
-      const countRow = await this.db.oneOrNone<{ count: number | string }>(
+      const countRow = await this.db.read.oneOrNone<{ count: number | string }>(
         `SELECT COUNT(*) AS "count" FROM ${this.table(TABLE_MCP_CLIENTS)} ${whereClause}`,
         binds,
       );
@@ -294,7 +300,7 @@ export class MCPClientsOracle extends MCPClientsStorage {
       const limit = perPageInput === false ? total : perPage;
       // `id ASC` breaks ties between rows sharing the same order-by value so
       // pages stay stable instead of duplicating or dropping rows across pages.
-      const rows = await this.db.manyOrNone<MCPClientRow>(
+      const rows = await this.db.read.manyOrNone<MCPClientRow>(
         `${this.clientSelect()} FROM ${this.table(TABLE_MCP_CLIENTS)} ${whereClause} ORDER BY ${this.clientOrderColumn(
           field,
         )} ${direction}, id ASC OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY`,
@@ -354,7 +360,7 @@ export class MCPClientsOracle extends MCPClientsStorage {
 
   async getVersion(id: string): Promise<MCPClientVersion | null> {
     try {
-      const row = await this.db.oneOrNone<MCPClientVersionRow>(
+      const row = await this.db.read.oneOrNone<MCPClientVersionRow>(
         `${this.versionSelect()} FROM ${this.table(TABLE_MCP_CLIENT_VERSIONS)} WHERE id = :id`,
         { id },
       );
@@ -366,7 +372,7 @@ export class MCPClientsOracle extends MCPClientsStorage {
 
   async getVersionByNumber(mcpClientId: string, versionNumber: number): Promise<MCPClientVersion | null> {
     try {
-      const row = await this.db.oneOrNone<MCPClientVersionRow>(
+      const row = await this.db.read.oneOrNone<MCPClientVersionRow>(
         `${this.versionSelect()} FROM ${this.table(
           TABLE_MCP_CLIENT_VERSIONS,
         )} WHERE ${VERSION_MCP_CLIENT_ID} = :mcpClientId AND ${VERSION_VERSION_NUMBER} = :versionNumber`,
@@ -380,7 +386,7 @@ export class MCPClientsOracle extends MCPClientsStorage {
 
   async getLatestVersion(mcpClientId: string): Promise<MCPClientVersion | null> {
     try {
-      const row = await this.db.oneOrNone<MCPClientVersionRow>(
+      const row = await this.db.read.oneOrNone<MCPClientVersionRow>(
         `${this.versionSelect()} FROM ${this.table(
           TABLE_MCP_CLIENT_VERSIONS,
         )} WHERE ${VERSION_MCP_CLIENT_ID} = :mcpClientId ORDER BY ${VERSION_VERSION_NUMBER} DESC FETCH FIRST 1 ROWS ONLY`,
@@ -412,7 +418,7 @@ export class MCPClientsOracle extends MCPClientsStorage {
 
     try {
       const { field, direction } = this.parseVersionOrderBy(orderBy);
-      const countRow = await this.db.oneOrNone<{ count: number | string }>(
+      const countRow = await this.db.read.oneOrNone<{ count: number | string }>(
         `SELECT COUNT(*) AS "count" FROM ${this.table(TABLE_MCP_CLIENT_VERSIONS)} WHERE ${VERSION_MCP_CLIENT_ID} = :mcpClientId`,
         { mcpClientId },
       );
@@ -441,7 +447,7 @@ export class MCPClientsOracle extends MCPClientsStorage {
       const limit = perPageInput === false ? total : perPage;
       // `id ASC` breaks ties between versions sharing the same order-by value so
       // pages stay stable instead of duplicating or dropping rows across pages.
-      const rows = await this.db.manyOrNone<MCPClientVersionRow>(
+      const rows = await this.db.read.manyOrNone<MCPClientVersionRow>(
         `${this.versionSelect()} FROM ${this.table(
           TABLE_MCP_CLIENT_VERSIONS,
         )} WHERE ${VERSION_MCP_CLIENT_ID} = :mcpClientId ORDER BY ${this.versionOrderColumn(
@@ -491,7 +497,7 @@ export class MCPClientsOracle extends MCPClientsStorage {
 
   async countVersions(mcpClientId: string): Promise<number> {
     try {
-      const row = await this.db.oneOrNone<{ count: number | string }>(
+      const row = await this.db.read.oneOrNone<{ count: number | string }>(
         `SELECT COUNT(*) AS "count" FROM ${this.table(TABLE_MCP_CLIENT_VERSIONS)} WHERE ${VERSION_MCP_CLIENT_ID} = :mcpClientId`,
         { mcpClientId },
       );
@@ -503,13 +509,13 @@ export class MCPClientsOracle extends MCPClientsStorage {
 
   private async createIndexes(): Promise<void> {
     await this.db.withConnection(async connection => {
-      if (!this.skipDefaultIndexes) {
-        for (const index of this.getDefaultIndexDefinitions()) {
-          try {
-            await createOracleIndex(connection, index, this.schemaName);
-          } catch (error) {
-            this.logger?.warn?.(`Failed to create Oracle default index ${index.name}:`, error);
-          }
+      for (const index of this.getDefaultIndexDefinitions()) {
+        if (this.skipDefaultIndexes && !index.unique) continue;
+        try {
+          await createOracleIndex(connection, index, this.schemaName);
+        } catch (error) {
+          if (index.unique) throw error;
+          this.logger?.warn?.(`Failed to create Oracle default index ${index.name}:`, error);
         }
       }
 
@@ -570,14 +576,9 @@ export class MCPClientsOracle extends MCPClientsStorage {
     }
 
     if (args.metadata && Object.keys(args.metadata).length > 0) {
-      let index = 0;
-      for (const [key, value] of Object.entries(args.metadata)) {
-        const bindName = `metadata${index++}`;
-        // Scalar metadata filters use JSON_VALUE so provider listings stay
-        // indexable without loading every client row.
-        conditions.push(`${jsonValue('metadata', key, value)} = :${bindName}`);
-        binds[bindName] = jsonComparableValue(value);
-      }
+      const metadata = buildOracleJsonContains('metadata', args.metadata);
+      conditions.push(metadata.sql);
+      Object.assign(binds, metadata.binds);
     }
 
     return { whereClause: `WHERE ${conditions.join(' AND ')}`, binds };
@@ -589,7 +590,7 @@ export class MCPClientsOracle extends MCPClientsStorage {
       `status AS "status"`,
       `${CLIENT_ACTIVE_VERSION_ID} AS "activeVersionId"`,
       `${CLIENT_AUTHOR_ID} AS "authorId"`,
-      `metadata AS "metadata"`,
+      `JSON_SERIALIZE(metadata RETURNING CLOB) AS "metadataJson"`,
       `${CLIENT_CREATED_AT} AS "createdAt"`,
       `${CLIENT_UPDATED_AT} AS "updatedAt"`,
     ].join(', ');
@@ -602,8 +603,8 @@ export class MCPClientsOracle extends MCPClientsStorage {
       `${VERSION_VERSION_NUMBER} AS "versionNumber"`,
       `name AS "name"`,
       `description AS "description"`,
-      `servers AS "servers"`,
-      `${VERSION_CHANGED_FIELDS} AS "changedFields"`,
+      `JSON_SERIALIZE(servers RETURNING CLOB) AS "servers"`,
+      `JSON_SERIALIZE(${VERSION_CHANGED_FIELDS} RETURNING CLOB) AS "changedFields"`,
       `${VERSION_CHANGE_MESSAGE} AS "changeMessage"`,
       `${VERSION_CREATED_AT} AS "createdAt"`,
     ].join(', ');
@@ -615,7 +616,7 @@ export class MCPClientsOracle extends MCPClientsStorage {
       status: row.status,
       activeVersionId: optionalString(row.activeVersionId),
       authorId: optionalString(row.authorId),
-      metadata: parseOptionalJsonObject(row.metadata),
+      metadata: parseOptionalJsonObject(row.metadataJson ?? row.metadata),
       createdAt: toDate(row.createdAt),
       updatedAt: toDate(row.updatedAt),
     };
@@ -689,20 +690,4 @@ export function getDefaultMCPClientIndexDefinitions(indexName: (name: string) =>
 function optionalString(value: unknown): string | undefined {
   if (value === null || value === undefined) return undefined;
   return String(value);
-}
-
-function jsonValue(column: string, path: string, comparisonValue: unknown): string {
-  const jsonPath = assertJsonPath(path);
-  if (typeof comparisonValue === 'number') {
-    return `JSON_VALUE(${column}, '${jsonPath}' RETURNING NUMBER NULL ON ERROR)`;
-  }
-  return `JSON_VALUE(${column}, '${jsonPath}' RETURNING VARCHAR2(4000) NULL ON ERROR)`;
-}
-
-function jsonComparableValue(value: unknown): unknown {
-  if (value instanceof Date) return value.toISOString();
-  if (typeof value === 'boolean') return String(value);
-  if (value === null || value === undefined) return '';
-  if (typeof value === 'object') return JSON.stringify(safeJsonValue(value));
-  return value;
 }

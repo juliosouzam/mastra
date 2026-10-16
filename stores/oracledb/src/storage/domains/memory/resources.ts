@@ -3,7 +3,7 @@ import type { RunFence, StorageResourceType } from '@mastra/core/storage';
 import { TABLE_RESOURCES } from '@mastra/core/storage';
 import type { Connection } from 'oracledb';
 
-import { executeOptions, jsonBind, rows } from '../../../shared/connection';
+import { executeOptions, isOracleErrorCode, jsonBind, rows } from '../../../shared/connection';
 import type { ObjectRow } from '../../../shared/connection';
 import { toDate } from '../../domain-utils';
 import { RESOURCE_CREATED_AT, RESOURCE_UPDATED_AT, RESOURCE_WORKING_MEMORY } from './schema';
@@ -14,6 +14,7 @@ import {
   parseOptionalString,
   storageError,
   table,
+  timestampBind,
 } from './utils';
 import type { MemoryContext } from './utils';
 
@@ -24,6 +25,7 @@ type ResourceRow = {
   id: string;
   workingMemory?: unknown;
   metadata?: unknown;
+  metadataJson?: unknown;
   createdAt: Date | string;
   updatedAt: Date | string;
 };
@@ -157,6 +159,60 @@ export async function updateResource(
   }
 }
 
+export async function mergeResourceWorkingMemory(
+  ctx: MemoryContext,
+  { resourceId, merge }: { resourceId: string; merge: (existing: string | undefined) => string },
+  fence?: RunFence,
+): Promise<StorageResourceType> {
+  const callbackError: { error?: unknown } = {};
+  try {
+    return await ctx.db.tx(async client => {
+      await assertMemoryFence(ctx, client, fence, 'mergeResourceWorkingMemory');
+      const now = new Date();
+      // Concurrent first writes wait on the primary key. Once the winning insert commits,
+      // the other writer can lock and merge the newly committed resource.
+      try {
+        await client.none(
+          `INSERT INTO ${table(ctx, TABLE_RESOURCES)} (id, metadata, ${RESOURCE_CREATED_AT}, ${RESOURCE_UPDATED_AT})
+           VALUES (:resourceId, :metadata, :createdAt, :updatedAt)`,
+          {
+            resourceId,
+            metadata: jsonBind({}),
+            createdAt: timestampBind(now),
+            updatedAt: timestampBind(now),
+          },
+        );
+      } catch (error) {
+        if (!isOracleErrorCode(error, [-1])) throw error;
+      }
+
+      const row = await client.one<ResourceRow>(
+        `${resourceSelect()} FROM ${table(ctx, TABLE_RESOURCES)} WHERE id = :resourceId FOR UPDATE`,
+        { resourceId },
+      );
+      const existing = parseResource(row);
+      let workingMemory: string;
+      try {
+        workingMemory = merge(existing.workingMemory);
+      } catch (error) {
+        callbackError.error = error;
+        throw error;
+      }
+      const updatedAt = new Date();
+      await client.none(
+        `UPDATE ${table(ctx, TABLE_RESOURCES)}
+         SET ${RESOURCE_WORKING_MEMORY} = :workingMemory, ${RESOURCE_UPDATED_AT} = :updatedAt
+         WHERE id = :resourceId`,
+        { resourceId, workingMemory: optionalClobStringBind(workingMemory), updatedAt: timestampBind(updatedAt) },
+      );
+      return { ...existing, workingMemory, updatedAt };
+    });
+  } catch (error) {
+    if (error === callbackError.error || error instanceof MastraError) throw error;
+    throw storageError('MERGE_RESOURCE_WORKING_MEMORY', 'FAILED', { resourceId }, error);
+  }
+}
+
 /**
  * Upserts one resource row against the given raw connection. Shared by
  * `saveResource` (auto-commit) and `updateResource`, which runs this inside
@@ -213,12 +269,12 @@ function parseResource(row: ResourceRow): StorageResourceType {
   return {
     id: String(row.id),
     workingMemory,
-    metadata: parseJson(row.metadata),
+    metadata: parseJson(row.metadataJson ?? row.metadata),
     createdAt: toDate(row.createdAt),
     updatedAt: toDate(row.updatedAt),
   };
 }
 
 function resourceSelect(): string {
-  return `SELECT id AS "id", ${RESOURCE_WORKING_MEMORY} AS "workingMemory", metadata AS "metadata", ${RESOURCE_CREATED_AT} AS "createdAt", ${RESOURCE_UPDATED_AT} AS "updatedAt"`;
+  return `SELECT id AS "id", ${RESOURCE_WORKING_MEMORY} AS "workingMemory", JSON_SERIALIZE(metadata RETURNING CLOB) AS "metadataJson", ${RESOURCE_CREATED_AT} AS "createdAt", ${RESOURCE_UPDATED_AT} AS "updatedAt"`;
 }

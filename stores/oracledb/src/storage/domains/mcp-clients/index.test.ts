@@ -15,7 +15,7 @@ describe('MCPClientsOracle pagination tie-breaker', () => {
       capturedSql = sql;
       return [];
     });
-    (mcpClients as any).db = { oneOrNone, manyOrNone };
+    (mcpClients as any).db = { read: { oneOrNone, manyOrNone } };
 
     await mcpClients.list();
 
@@ -30,7 +30,7 @@ describe('MCPClientsOracle pagination tie-breaker', () => {
       capturedSql = sql;
       return [];
     });
-    (mcpClients as any).db = { oneOrNone, manyOrNone };
+    (mcpClients as any).db = { read: { oneOrNone, manyOrNone } };
 
     await mcpClients.listVersions({ mcpClientId: 'mcp-client-1' });
 

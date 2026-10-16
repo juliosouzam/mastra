@@ -1,7 +1,7 @@
 services:
   db:
-    image: gvenzl/oracle-free:23-slim-faststart
-    container_name: 'oracledb-test-db'
+    image: ${ORACLE_DATABASE_IMAGE:-gvenzl/oracle-free:23-slim-faststart}
+    container_name: ${ORACLE_DATABASE_CONTAINER_NAME:-oracledb-test-db}
     ports:
       - '${ORACLE_DATABASE_PORT:-1521}:1521'
     environment:
@@ -17,6 +17,7 @@ services:
       # Without the restart, the Vector Pool stays at 0: exact search (default) and IVF indexes
       # still work, only HNSW index builds require this step.
       - ./scripts/configure-vector-memory.sql:/container-entrypoint-initdb.d/01-configure-vector-memory.sql:ro
+      - ./scripts/configure-observability.sh:/container-entrypoint-initdb.d/02-configure-observability.sh:ro
     healthcheck:
       test: ['CMD', 'healthcheck.sh']
       interval: 10s

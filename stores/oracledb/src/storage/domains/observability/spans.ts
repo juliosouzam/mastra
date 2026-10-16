@@ -49,6 +49,7 @@ import {
   qcol,
   scoreCol,
   SPAN_COLUMNS,
+  SPAN_JSON_COLUMNS,
   SPAN_KEY_COLUMNS,
   SPAN_SCHEMA,
   storageError,
@@ -546,7 +547,7 @@ function updateColumns(updates: Record<string, unknown>): SpanColumn[] {
 }
 
 function spanSelect(columns: readonly SpanColumn[], tableAlias?: string): string {
-  return `SELECT ${columns.map(columnName => `${qcol(tableAlias, columnName)} AS "${columnName}"`).join(', ')}`;
+  return `SELECT ${columns.map(columnName => `${SPAN_JSON_COLUMNS.has(columnName) ? `JSON_SERIALIZE(${qcol(tableAlias, columnName)} RETURNING CLOB)` : qcol(tableAlias, columnName)} AS "${columnName}"`).join(', ')}`;
 }
 
 function transformSpanRow<T extends SpanRow>(row: SpanRow): T {

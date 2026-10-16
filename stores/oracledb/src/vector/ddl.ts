@@ -4,7 +4,13 @@ import type { Connection } from 'oracledb';
 import type oracledb from 'oracledb';
 
 import type { ObjectRow } from '../shared/connection';
-import { executeDdl as executeOracleDdl, executeOptions, isOracleErrorCode, rows } from '../shared/connection';
+import {
+  executeDdl as executeOracleDdl,
+  executeOptions,
+  isOracleErrorCode,
+  jsonBind,
+  rows,
+} from '../shared/connection';
 import {
   assertJsonPath,
   indexNameForMetadataField,
@@ -17,6 +23,7 @@ import {
 } from './identifiers';
 import {
   buildVectorIndexParameterClause,
+  DEFAULT_NAMESPACE,
   defaultMetricForFormat,
   metricToken,
   normalizeMetric,
@@ -25,7 +32,7 @@ import {
   validateDimension,
   validateMetricForFormat,
   validateVectorFormatDimension,
-  vectorFormatToken,
+  vectorColumnType,
 } from './sql';
 import type {
   OracleBuildIndexParams,
@@ -69,6 +76,7 @@ export interface IndexRegistryConfig {
   defaultMetadataIndexes: string[];
   defaultVectorFormat: OracleVectorFormat;
   defaultIndexConfig: OracleVectorIndexConfig;
+  isInitializationDisabled?: () => boolean;
 }
 
 // IndexRegistry owns the mutable state (locks, caches, registry readiness) plus every DDL/registry
@@ -80,9 +88,11 @@ export class IndexRegistry {
   private readonly defaultMetadataIndexes: string[];
   private readonly defaultVectorFormat: OracleVectorFormat;
   private readonly defaultIndexConfig: OracleVectorIndexConfig;
+  private readonly isInitializationDisabled: () => boolean;
   // One lock per logical index prevents two callers from creating/dropping the same Oracle objects at once.
   private readonly indexLocks = new Map<string, Promise<void>>();
   private readonly indexInfoCache = new Map<string, CachedIndexInfo>();
+  private readonly namespaceInitializations = new Map<string, Promise<void>>();
   private registryReady = false;
   private registryPromise?: Promise<void>;
 
@@ -93,6 +103,7 @@ export class IndexRegistry {
     this.defaultMetadataIndexes = config.defaultMetadataIndexes;
     this.defaultVectorFormat = config.defaultVectorFormat;
     this.defaultIndexConfig = config.defaultIndexConfig;
+    this.isInitializationDisabled = config.isInitializationDisabled ?? (() => false);
   }
 
   async createIndex(
@@ -117,6 +128,8 @@ export class IndexRegistry {
       validateDimension(dimension);
       validateVectorFormatDimension(normalizedFormat, dimension);
       validateMetricForFormat(normalizedMetric, normalizedFormat, mergedConfig.type);
+      buildVectorIndexParameterClause(mergedConfig);
+      if (this.isInitializationDisabled()) return;
 
       await this.withIndexLock(logicalIndexName, () =>
         withConnection(async connection => {
@@ -134,6 +147,7 @@ export class IndexRegistry {
                 normalizedMetric,
                 normalizedFormat,
               );
+              await this.ensureNamespace(connection, tableName);
             } else {
               await this.createVectorTable(connection, logicalIndexName, dimension, normalizedFormat);
               await this.upsertRegistry(
@@ -143,6 +157,7 @@ export class IndexRegistry {
                 normalizedMetric,
                 normalizedFormat,
                 unbuiltConfig,
+                mergedConfig,
               );
               this.clearIndexMetadata(logicalIndexName);
             }
@@ -154,6 +169,7 @@ export class IndexRegistry {
               tableName,
             );
 
+            let storedIndexConfig = existing.indexConfig;
             if (buildIndex && mergedConfig.type !== 'none') {
               const createdIndex = await this.createVectorIndex(
                 connection,
@@ -170,6 +186,7 @@ export class IndexRegistry {
               }
               if (createdIndex) {
                 await this.updateRegistryIndexConfig(connection, logicalIndexName, normalizedMetric, mergedConfig);
+                storedIndexConfig = mergedConfig;
               }
             }
             const finalInfo =
@@ -180,6 +197,7 @@ export class IndexRegistry {
                     metric: normalizedMetric,
                     indexType: mergedConfig.type,
                     accuracy: mergedConfig.accuracy ?? 95,
+                    indexConfig: storedIndexConfig,
                   }
                 : tableExists
                   ? { ...existing, tableName }
@@ -191,6 +209,7 @@ export class IndexRegistry {
                       indexType: builtConfig.type,
                       vectorFormat: normalizedFormat,
                       accuracy: builtConfig.accuracy ?? 95,
+                      indexConfig: mergedConfig,
                     };
             this.cacheIndexMetadata(logicalIndexName, {
               ...finalInfo,
@@ -238,6 +257,7 @@ export class IndexRegistry {
             normalizedMetric,
             normalizedFormat,
             unbuiltConfig,
+            mergedConfig,
           );
           this.clearIndexMetadata(logicalIndexName);
           await this.createMetadataIndexes(
@@ -269,6 +289,7 @@ export class IndexRegistry {
             indexType: builtConfig.type,
             vectorFormat: normalizedFormat,
             accuracy: builtConfig.accuracy ?? 95,
+            indexConfig: mergedConfig,
             qualifiedTableName: qualifyName(tableName, this.schemaName),
           });
         }),
@@ -296,7 +317,7 @@ export class IndexRegistry {
                 type: indexInfo.indexType,
                 accuracy: indexInfo.accuracy,
               };
-        const mergedConfig = this.mergeIndexConfig(indexConfig ?? existingBuiltConfig);
+        const mergedConfig = this.mergeIndexConfig(indexConfig ?? indexInfo.indexConfig ?? existingBuiltConfig);
 
         // `none` is a valid exact-search mode, so buildIndex becomes a no-op for those indexes.
         if (mergedConfig.type === 'none') return;
@@ -324,6 +345,7 @@ export class IndexRegistry {
           metric: normalizedMetric,
           indexType: mergedConfig.type,
           accuracy: mergedConfig.accuracy ?? 95,
+          indexConfig: mergedConfig,
         });
       }),
     ).catch(error => {
@@ -344,10 +366,11 @@ export class IndexRegistry {
         const indexInfo = await this.getIndexMetadata(connection, logicalIndexName);
         const normalizedMetric = normalizeMetric(metric ?? indexInfo.metric);
         const mergedConfig = this.mergeIndexConfig(
-          indexConfig ?? {
-            type: indexInfo.indexType,
-            accuracy: indexInfo.accuracy,
-          },
+          indexConfig ??
+            indexInfo.indexConfig ?? {
+              type: indexInfo.indexType,
+              accuracy: indexInfo.accuracy,
+            },
         );
         validateMetricForFormat(normalizedMetric, indexInfo.vectorFormat, mergedConfig.type);
 
@@ -373,6 +396,7 @@ export class IndexRegistry {
           metric: normalizedMetric,
           indexType: mergedConfig.type,
           accuracy: mergedConfig.accuracy ?? 95,
+          indexConfig: mergedConfig,
         });
       }),
     ).catch(error => {
@@ -400,11 +424,27 @@ export class IndexRegistry {
           },
         );
         await connection.commit();
+        this.namespaceInitializations.delete(
+          registryRow?.tableName ?? tableNameForIndex(logicalIndexName, this.tablePrefix),
+        );
         this.clearIndexMetadata(logicalIndexName);
       }),
     ).catch(error => {
       if (error instanceof MastraError) throw error;
       throw asMastraError('DELETE_INDEX', 'FAILED', { indexName }, error);
+    });
+  }
+
+  async truncateIndex(withConnection: WithConnection, { indexName }: DeleteIndexParams): Promise<void> {
+    const logicalIndexName = normalizeLogicalIndexName(indexName);
+    return this.withIndexLock(logicalIndexName, () =>
+      withConnection(async connection => {
+        const index = await this.getIndexMetadata(connection, logicalIndexName);
+        await executeOracleDdl(connection, `TRUNCATE TABLE ${index.qualifiedTableName}`);
+      }),
+    ).catch(error => {
+      if (error instanceof MastraError) throw error;
+      throw asMastraError('TRUNCATE_INDEX', 'FAILED', { indexName }, error);
     });
   }
 
@@ -430,6 +470,7 @@ export class IndexRegistry {
   }
 
   async ensureRegistry(connection: Connection): Promise<void> {
+    if (this.isInitializationDisabled()) return;
     if (this.registryReady) return;
     if (!this.registryPromise) {
       this.registryPromise = (async () => {
@@ -445,6 +486,7 @@ export class IndexRegistry {
             index_type VARCHAR2(16) NOT NULL,
             vector_format VARCHAR2(16) DEFAULT 'vector' NOT NULL,
             accuracy NUMBER(3),
+            index_config JSON,
             created_at TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
             updated_at TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL
           )`,
@@ -453,6 +495,11 @@ export class IndexRegistry {
         await executeOracleDdl(
           connection,
           `ALTER TABLE ${this.qualifiedRegistryTable()} ADD vector_format VARCHAR2(16) DEFAULT 'vector' NOT NULL`,
+          [-1430],
+        );
+        await executeOracleDdl(
+          connection,
+          `ALTER TABLE ${this.qualifiedRegistryTable()} ADD index_config JSON`,
           [-1430],
         );
         this.registryReady = true;
@@ -475,11 +522,13 @@ export class IndexRegistry {
       connection,
       `
       CREATE TABLE ${this.qualifiedTableName(indexName)} (
-        vector_id VARCHAR2(512) PRIMARY KEY,
-        embedding VECTOR(${dimension}, ${vectorFormatToken(vectorFormat)}) NOT NULL,
+        vector_id VARCHAR2(512) NOT NULL,
+        namespace VARCHAR2(255 CHAR) DEFAULT '${DEFAULT_NAMESPACE}' NOT NULL,
+        embedding ${vectorColumnType(dimension, vectorFormat)} NOT NULL,
         metadata JSON NOT NULL,
         created_at TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
-        updated_at TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL
+        updated_at TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
+        PRIMARY KEY (namespace, vector_id)
       )`,
       [-955],
     );
@@ -492,6 +541,7 @@ export class IndexRegistry {
     metric: OracleMetric,
     vectorFormat: OracleVectorFormat,
     indexConfig?: OracleVectorIndexConfig,
+    requestedIndexConfig?: OracleVectorIndexConfig,
   ): Promise<void> {
     const tableName = tableNameForIndex(indexName, this.tablePrefix);
     const mergedConfig = this.mergeIndexConfig(indexConfig);
@@ -508,7 +558,8 @@ export class IndexRegistry {
           :metric AS metric,
           :index_type AS index_type,
           :vector_format AS vector_format,
-          :accuracy AS accuracy
+          :accuracy AS accuracy,
+          :index_config AS index_config
         FROM dual
       ) source
       ON (target.index_name = source.index_name)
@@ -519,6 +570,7 @@ export class IndexRegistry {
         target.index_type = source.index_type,
         target.vector_format = source.vector_format,
         target.accuracy = source.accuracy,
+        target.index_config = source.index_config,
         target.updated_at = SYSTIMESTAMP
       WHEN NOT MATCHED THEN INSERT (
         index_name,
@@ -528,6 +580,7 @@ export class IndexRegistry {
         index_type,
         vector_format,
         accuracy,
+        index_config,
         created_at,
         updated_at
       ) VALUES (
@@ -538,6 +591,7 @@ export class IndexRegistry {
         source.index_type,
         source.vector_format,
         source.accuracy,
+        source.index_config,
         SYSTIMESTAMP,
         SYSTIMESTAMP
       )`,
@@ -549,6 +603,7 @@ export class IndexRegistry {
         index_type: mergedConfig.type ?? 'none',
         vector_format: vectorFormat,
         accuracy: mergedConfig.accuracy ?? 95,
+        index_config: jsonBind(requestedIndexConfig ?? mergedConfig),
       },
     );
     await connection.commit();
@@ -568,6 +623,7 @@ export class IndexRegistry {
         metric = :metric,
         index_type = :index_type,
         accuracy = :accuracy,
+        index_config = :index_config,
         updated_at = SYSTIMESTAMP
       WHERE index_name = :indexName`,
       {
@@ -575,6 +631,7 @@ export class IndexRegistry {
         metric,
         index_type: mergedConfig.type ?? 'none',
         accuracy: mergedConfig.accuracy ?? 95,
+        index_config: jsonBind(mergedConfig),
       },
     );
     await connection.commit();
@@ -674,10 +731,80 @@ export class IndexRegistry {
     }
 
     const qualifiedTableName = qualifyName(registryRow.tableName, this.schemaName);
+    await this.ensureNamespace(connection, registryRow.tableName);
     return this.cacheIndexMetadata(logicalIndexName, {
       ...registryRow,
       qualifiedTableName,
     });
+  }
+
+  private async ensureNamespace(connection: Connection, tableName: string): Promise<void> {
+    const pending = this.namespaceInitializations.get(tableName);
+    if (pending) return pending;
+
+    const initialize = async () => {
+      const loadPrimaryKey = async () => {
+        const result = await connection.execute<ObjectRow>(
+          `SELECT cols.constraint_name AS "constraintName", cols.column_name AS "columnName"
+           FROM all_constraints constraints
+           JOIN all_cons_columns cols ON cols.owner = constraints.owner
+             AND cols.constraint_name = constraints.constraint_name AND cols.table_name = constraints.table_name
+           WHERE constraints.owner = NVL(:ownerName, SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA'))
+             AND constraints.table_name = :tableName AND constraints.constraint_type = 'P'
+           ORDER BY cols.position`,
+          { ownerName: this.schemaName ?? null, tableName },
+          executeOptions(),
+        );
+        return rows(result);
+      };
+      const hasNamespaceKey = (key: ObjectRow[]) =>
+        key.length === 2 &&
+        key.some(row => row.columnName === 'NAMESPACE') &&
+        key.some(row => row.columnName === 'VECTOR_ID');
+      const primaryKey = await loadPrimaryKey();
+      if (hasNamespaceKey(primaryKey)) return;
+      if (this.isInitializationDisabled()) {
+        throw asMastraError(
+          'INITIALIZATION',
+          'NAMESPACE_SCHEMA_REQUIRED',
+          { tableName },
+          new Error(
+            `Vector table ${tableName} requires the namespace schema, but automatic initialization is disabled`,
+          ),
+          ErrorCategory.USER,
+        );
+      }
+      if (primaryKey.length > 0 && (primaryKey.length !== 1 || primaryKey[0]?.columnName !== 'VECTOR_ID')) {
+        throw new Error(`Vector table ${tableName} has an incompatible primary key for namespace isolation`);
+      }
+
+      const table = qualifyName(tableName, this.schemaName);
+      await executeOracleDdl(
+        connection,
+        `ALTER TABLE ${table} ADD namespace VARCHAR2(255 CHAR) DEFAULT '${DEFAULT_NAMESPACE}' NOT NULL`,
+        [-1430],
+      );
+      if (primaryKey[0]) {
+        // Use the catalog's exact name so another process cannot drop the replacement
+        // key after completing the same upgrade. Escape quoted DBA-assigned names.
+        const constraint = String(primaryKey[0].constraintName).replaceAll('"', '""');
+        await executeOracleDdl(connection, `ALTER TABLE ${table} DROP CONSTRAINT "${constraint}"`, [-2443]);
+      }
+      const added = await executeOracleDdl(
+        connection,
+        `ALTER TABLE ${table} ADD PRIMARY KEY (namespace, vector_id)`,
+        [-2260],
+      );
+      if (!added && !hasNamespaceKey(await loadPrimaryKey())) {
+        throw new Error(`Vector table ${tableName} requires a primary key on namespace and vector_id`);
+      }
+    };
+    const initialization = initialize().catch(error => {
+      this.namespaceInitializations.delete(tableName);
+      throw error;
+    });
+    this.namespaceInitializations.set(tableName, initialization);
+    return initialization;
   }
 
   cacheIndexMetadata(indexName: string, indexInfo: CachedIndexInfo): CachedIndexInfo {
@@ -709,7 +836,8 @@ export class IndexRegistry {
         metric AS "metric",
         index_type AS "indexType",
         vector_format AS "vectorFormat",
-        accuracy AS "accuracy"
+        accuracy AS "accuracy",
+        index_config AS "indexConfig"
       FROM ${this.qualifiedRegistryTable()}
       WHERE index_name IN (:indexName, :legacyIndexName)
       ORDER BY CASE WHEN index_name = :indexName THEN 0 ELSE 1 END
@@ -729,6 +857,12 @@ export class IndexRegistry {
       vectorFormat: normalizeVectorFormat(String(registryRow.vectorFormat ?? DEFAULT_VECTOR_FORMAT)),
       accuracy:
         registryRow.accuracy === null || registryRow.accuracy === undefined ? undefined : Number(registryRow.accuracy),
+      indexConfig:
+        registryRow.indexConfig == null
+          ? undefined
+          : ((typeof registryRow.indexConfig === 'string'
+              ? JSON.parse(registryRow.indexConfig)
+              : registryRow.indexConfig) as OracleVectorIndexConfig),
     };
   }
 
@@ -852,14 +986,20 @@ export function normalizeIndexType(indexType: string): OracleVectorIndexType {
 }
 
 function vectorIndexRegistryConfigMatches(
-  indexInfo: Pick<OracleIndexStats, 'metric' | 'indexType' | 'accuracy'>,
+  indexInfo: Pick<OracleIndexStats, 'metric' | 'indexType' | 'accuracy' | 'indexConfig'>,
   metric: OracleMetric,
   indexConfig: OracleVectorIndexConfig,
 ): boolean {
   return (
     indexInfo.metric === metric &&
     indexInfo.indexType === normalizeIndexType(indexConfig.type ?? 'none') &&
-    (indexInfo.accuracy ?? 95) === (indexConfig.accuracy ?? 95)
+    (indexInfo.accuracy ?? 95) === (indexConfig.accuracy ?? 95) &&
+    // Older registry rows never recorded tuning. Preserve their idempotent create behavior,
+    // but leave indexConfig unknown until an explicit build/rebuild records actual parameters.
+    (!indexInfo.indexConfig ||
+      (indexInfo.indexConfig.hnsw?.neighbors === indexConfig.hnsw?.neighbors &&
+        indexInfo.indexConfig.hnsw?.efConstruction === indexConfig.hnsw?.efConstruction &&
+        indexInfo.indexConfig.ivf?.neighborPartitions === indexConfig.ivf?.neighborPartitions))
   );
 }
 

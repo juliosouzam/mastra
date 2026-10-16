@@ -60,6 +60,8 @@ Special Operators:
   Example: { "tags": { "$size": 2 } }
 - $regex: Oracle regular expression match using REGEXP_LIKE
   Example: { "source": { "$regex": "oracle.*database" } }
+- $options: Regex flags used together with $regex; supports i (case-insensitive), m (multiline), s (dot matches newlines), x (ignore pattern whitespace), and native Unicode matching with u
+  Example: { "source": { "$regex": "oracle.*database", "$options": "is" } }
 
 Restrictions:
 - Nested fields are supported using dot notation
@@ -68,6 +70,7 @@ Restrictions:
 - Empty arrays in $in, $nin, and $all conditions are handled gracefully
 - Only logical operators ($and, $or, $not, $nor) can be used at the top level
 - All other operators must be used within a field condition
+- $options must be paired with $regex in the same condition
   Valid: { "field": { "$gt": 100 } }
   Valid: { "$and": [{ "field": { "$gt": 100 } }] }
   Invalid: { "$gt": 100 }

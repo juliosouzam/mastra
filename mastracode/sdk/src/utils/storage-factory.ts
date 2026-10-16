@@ -50,7 +50,7 @@ export function buildLibSQLVector(opts: { id?: string; url: string; authToken?: 
 export interface StorageResult {
   storage: MastraCompositeStore;
   /** The effective backend after any fallback logic has run. */
-  backend: 'libsql' | 'pg';
+  backend: 'libsql' | 'pg' | 'oracle';
   /** Non-null when PG was requested but failed — contains a user-facing warning. */
   warning?: string;
 }
@@ -136,11 +136,15 @@ async function createPgStorage(config: PgStorageConfig): Promise<StorageResult> 
  * Create a vector store for recall search.
  * Uses a separate LibSQL file to avoid bloating the main storage DB with embedding data.
  * For PG backends, reuses the same connection (PG handles the extra tables fine).
+ * Injected OracleStore instances use the caller-provided OracleVector; this factory creates no fallback.
  */
 export async function createVectorStore(
   config: StorageConfig,
-  effectiveBackend: 'libsql' | 'pg' = config.backend,
+  effectiveBackend: 'libsql' | 'pg' | 'oracle' = config.backend,
 ): Promise<MastraVector | undefined> {
+  // Injected Oracle storage uses the caller's explicitly supplied OracleVector.
+  if (effectiveBackend === 'oracle') return undefined;
+
   if (effectiveBackend === 'pg') {
     // PG can handle vector tables in the same database
     const pgConfig = config as PgStorageConfig;

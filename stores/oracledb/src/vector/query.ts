@@ -1,14 +1,23 @@
 import { ErrorCategory, MastraError } from '@mastra/core/error';
 import { validateTopK } from '@mastra/core/vector';
 import type { QueryResult } from '@mastra/core/vector';
+import oracledb from 'oracledb';
 
 import type { ObjectRow } from '../shared/connection';
 import { asBindParameters, executeOptions, rows } from '../shared/connection';
 import type { IndexRegistry, WithConnection } from './ddl';
 import { buildMetadataWhereClause } from './filter';
-import { metricToken, validateAccuracy } from './sql';
-import type { OracleMetric, OracleQueryVectorParams, OracleVectorFormat } from './types';
-import { STORE_NAME, asMastraError, validateVectorForIndex, validateVectors, vectorBind } from './upsert';
+import { metricToken, namespaceWhereClause, normalizeNamespace, normalizeScoreMode, validateAccuracy } from './sql';
+import type { OracleMetric, OracleQueryVectorParams, OracleScoreMode, OracleVectorFormat } from './types';
+import {
+  STORE_NAME,
+  asMastraError,
+  sparseVectorBind,
+  validateSparseVector,
+  validateVectorForIndex,
+  validateVectors,
+  vectorBind,
+} from './upsert';
 
 // Handles exact and approximate vector search, including the metadata-only recall path and the
 // min-score post-filter that Oracle distance scores need for parity with other Mastra providers.
@@ -22,19 +31,26 @@ export async function query(
     filter,
     includeVector = false,
     minScore = -1,
+    scoreMode = 'native',
     sparseVector,
     queryMode,
     targetAccuracy,
+    ef,
+    probes,
+    namespace,
   }: OracleQueryVectorParams,
 ): Promise<QueryResult[]> {
   try {
+    namespace = normalizeNamespace(namespace);
+    scoreMode = normalizeScoreMode(scoreMode);
     if (sparseVector !== undefined) {
-      throw new Error('OracleVector does not support sparseVector queries yet; use dense queryVector search');
+      if (queryVector !== undefined) throw new Error('Provide either queryVector or sparseVector, not both');
+      validateSparseVector(sparseVector);
     }
     validateTopK(STORE_NAME, topK);
     if (queryVector !== undefined) {
       validateVectors([queryVector]);
-    } else if (!filter || Object.keys(filter).length === 0) {
+    } else if (sparseVector === undefined && (!filter || Object.keys(filter).length === 0)) {
       throw new Error('Either queryVector or filter must be provided');
     }
     if (!Number.isFinite(minScore)) {
@@ -42,6 +58,17 @@ export async function query(
     }
     if (targetAccuracy !== undefined) {
       validateAccuracy(targetAccuracy);
+    }
+    for (const [name, value] of [
+      ['ef', ef],
+      ['probes', probes],
+    ] as const) {
+      if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
+        throw new Error(`${name} must be a positive safe integer`);
+      }
+    }
+    if (targetAccuracy !== undefined && (ef !== undefined || probes !== undefined)) {
+      throw new Error('targetAccuracy cannot be combined with ef or probes');
     }
   } catch (error) {
     if (error instanceof MastraError) throw error;
@@ -53,39 +80,72 @@ export async function query(
     if (queryVector !== undefined) {
       validateVectorForIndex(queryVector, indexInfo, indexName);
     }
+    const queryEmbedding =
+      sparseVector !== undefined
+        ? sparseVectorBind(sparseVector, indexInfo, indexName)
+        : queryVector !== undefined
+          ? vectorBind(queryVector, indexInfo.vectorFormat)
+          : undefined;
 
     const metadataFilter = buildMetadataWhereClause(filter);
+    metadataFilter.sql = namespaceWhereClause(metadataFilter.sql);
+    metadataFilter.binds.namespace = namespace;
     const vectorColumn = includeVector ? ', embedding AS "vector"' : '';
 
-    if (queryVector === undefined) {
+    if (queryEmbedding === undefined) {
       // Metadata-only queries preserve provider parity for filtered recalls without a query embedding.
       const sql = `
         SELECT
           vector_id AS "id",
           0 AS "score",
-          metadata AS "metadata"
+          JSON_SERIALIZE(metadata RETURNING CLOB) AS "metadata"
           ${vectorColumn}
         FROM ${indexInfo.qualifiedTableName}
         ${metadataFilter.sql}
         ORDER BY vector_id
         FETCH FIRST ${topK} ROWS ONLY`;
 
-      const result = await connection.execute<ObjectRow>(sql, asBindParameters(metadataFilter.binds), executeOptions());
+      const result = await connection.execute<ObjectRow>(
+        sql,
+        asBindParameters(metadataFilter.binds),
+        executeOptions(['metadata']),
+      );
       return rows(result).map(row => rowToQueryResult(row, indexInfo.vectorFormat, indexInfo.dimension));
     }
 
     const distance = `VECTOR_DISTANCE(embedding, :queryVector, ${metricToken(indexInfo.metric)})`;
-    const score = scoreExpression(distance, indexInfo.metric);
+    const score = scoreExpression(distance, indexInfo.metric, indexInfo.dimension, scoreMode);
     const fetchMode = normalizeQueryMode(queryMode ?? (indexInfo.indexType === 'none' ? 'exact' : 'approx'));
+    if (fetchMode === 'approx') {
+      const invalidParameter =
+        ef !== undefined && indexInfo.indexType !== 'hnsw'
+          ? 'ef requires an HNSW index'
+          : probes !== undefined && indexInfo.indexType !== 'ivf'
+            ? 'probes requires an IVF index'
+            : undefined;
+      if (invalidParameter) {
+        throw asMastraError('QUERY', 'INVALID_INPUT', { indexName }, new Error(invalidParameter), ErrorCategory.USER);
+      }
+    }
     // Oracle applies approximate index search only when ORDER BY and FETCH are in the same query block.
+    const searchParameters = [
+      ef !== undefined ? `EFSEARCH ${ef}` : '',
+      probes !== undefined ? `NEIGHBOR PARTITION PROBES ${probes}` : '',
+    ].filter(Boolean);
     const targetAccuracyClause =
-      fetchMode === 'approx' && targetAccuracy !== undefined ? ` WITH TARGET ACCURACY ${targetAccuracy}` : '';
-    if (canSkipMinScoreFilter(indexInfo.metric, minScore)) {
+      fetchMode !== 'approx'
+        ? ''
+        : searchParameters.length
+          ? ` WITH TARGET ACCURACY PARAMETERS (${searchParameters.join(', ')})`
+          : targetAccuracy !== undefined
+            ? ` WITH TARGET ACCURACY ${targetAccuracy}`
+            : '';
+    if (scoreMode === 'native' && canSkipMinScoreFilter(indexInfo.metric, minScore)) {
       const sql = `
         SELECT
           vector_id AS "id",
           ${score} AS "score",
-          metadata AS "metadata"
+          JSON_SERIALIZE(metadata RETURNING CLOB) AS "metadata"
           ${vectorColumn}
         FROM ${indexInfo.qualifiedTableName}
         ${metadataFilter.sql}
@@ -96,9 +156,9 @@ export async function query(
         sql,
         {
           ...metadataFilter.binds,
-          queryVector: vectorBind(queryVector, indexInfo.vectorFormat),
+          queryVector: queryEmbedding,
         },
-        executeOptions(),
+        executeOptions(['metadata']),
       );
 
       return rows(result).map(row => rowToQueryResult(row, indexInfo.vectorFormat, indexInfo.dimension));
@@ -109,7 +169,7 @@ export async function query(
         SELECT
           vector_id AS "id",
           ${score} AS "score",
-          metadata AS "metadata"
+          JSON_SERIALIZE(metadata RETURNING CLOB) AS "metadata"
           ${vectorColumn}
         FROM ${indexInfo.qualifiedTableName}
         ${metadataFilter.sql}
@@ -122,17 +182,17 @@ export async function query(
         "metadata"
         ${includeVector ? ', "vector"' : ''}
       FROM vector_scores
-      WHERE "score" >= :minScore
+      WHERE "score" ${scoreMode === 'postgres' ? '>' : '>='} :minScore
       ORDER BY "score" DESC`;
 
     const result = await connection.execute<ObjectRow>(
       sql,
       {
         ...metadataFilter.binds,
-        queryVector: vectorBind(queryVector, indexInfo.vectorFormat),
+        queryVector: queryEmbedding,
         minScore,
       },
-      executeOptions(),
+      executeOptions(['metadata']),
     );
 
     return rows(result).map(row => rowToQueryResult(row, indexInfo.vectorFormat, indexInfo.dimension));
@@ -150,8 +210,14 @@ function normalizeQueryMode(queryMode: string): 'approx' | 'exact' {
   return normalized;
 }
 
-function scoreExpression(distanceExpression: string, metric: OracleMetric): string {
+function scoreExpression(
+  distanceExpression: string,
+  metric: OracleMetric,
+  dimension: number,
+  scoreMode: OracleScoreMode,
+): string {
   // Mastra expects higher scores to be better, while Oracle distance is lower-is-better.
+  if (scoreMode === 'postgres' && metric === 'hamming') return `1 - (${distanceExpression} / ${dimension})`;
   switch (metric) {
     case 'euclidean':
     case 'hamming':
@@ -195,6 +261,7 @@ function parseJson(value: unknown): Record<string, unknown> {
 
 function parseVector(value: unknown, vectorFormat: OracleVectorFormat, dimension: number): number[] {
   // Oracle clients may return VECTOR values as arrays, typed arrays, or JSON strings depending on mode.
+  if (value instanceof oracledb.SparseVector) return Array.from(value.dense() ?? []);
   if (Array.isArray(value)) {
     const values = value.map(Number);
     return vectorFormat === 'bit' && values.length !== dimension ? unpackBitVector(values, dimension) : values;

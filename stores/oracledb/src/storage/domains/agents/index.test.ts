@@ -15,7 +15,7 @@ describe('AgentsOracle pagination tie-breaker', () => {
       capturedSql = sql;
       return [];
     });
-    (agents as any).db = { oneOrNone, manyOrNone };
+    (agents as any).db = { read: { oneOrNone, manyOrNone } };
 
     await agents.list();
 
@@ -30,7 +30,7 @@ describe('AgentsOracle pagination tie-breaker', () => {
       capturedSql = sql;
       return [];
     });
-    (agents as any).db = { oneOrNone, manyOrNone };
+    (agents as any).db = { read: { oneOrNone, manyOrNone } };
 
     await agents.listVersions({ agentId: 'agent-1' });
 

@@ -202,7 +202,7 @@ describe('ScoresOracle pagination tie-breaker', () => {
       capturedSql = sql;
       return [];
     });
-    (scores as any).db = { oneOrNone, execute };
+    (scores as any).db = { read: { oneOrNone, execute } };
 
     await scores.listScoresByRunId({ runId: 'run-1', pagination: { page: 0, perPage: 10 } });
 

@@ -97,19 +97,27 @@ function buildFieldExpression(path: string, value: unknown, collector: BindColle
     throw new Error(`Unsupported mixed operator/nested-field filter for "${path}"`);
   }
 
+  const options = regexOptions(value);
   return operatorEntries
-    .map(([operator, operand]) => buildOperatorExpression(path, operator, operand, collector))
+    .filter(([operator]) => operator !== '$options')
+    .map(([operator, operand]) => buildOperatorExpression(path, operator, operand, collector, options))
     .map(expr => `(${expr})`)
     .join(' AND ');
 }
 
-function buildOperatorExpression(path: string, operator: string, value: unknown, collector: BindCollector): string {
+function buildOperatorExpression(
+  path: string,
+  operator: string,
+  value: unknown,
+  collector: BindCollector,
+  options = '',
+): string {
   switch (operator) {
     case '$eq':
-      if (value === null) return `${jsonValue(path, value)} IS NULL`;
+      if (value === null) return jsonNullCondition(path);
       return `${jsonValue(path, value)} = ${bind(collector, value)}`;
     case '$ne':
-      if (value === null) return `${jsonValue(path, value)} IS NOT NULL`;
+      if (value === null) return jsonNullCondition(path, true);
       return `${jsonValue(path, value)} <> ${bind(collector, value)}`;
     case '$gt':
       return `${jsonValue(path, value)} > ${bind(collector, value)}`;
@@ -132,7 +140,12 @@ function buildOperatorExpression(path: string, operator: string, value: unknown,
         ? `JSON_EXISTS(metadata, '${assertJsonPath(path)}')`
         : `NOT JSON_EXISTS(metadata, '${assertJsonPath(path)}')`;
     case '$regex':
-      return buildRegexExpression(path, String(value), '', collector);
+      return buildRegexExpression(
+        path,
+        value instanceof RegExp ? value.source : String(value),
+        value instanceof RegExp ? value.flags + options : options,
+        collector,
+      );
     case '$contains':
       return buildContainsExpression(path, value, collector);
     case '$size':
@@ -149,12 +162,14 @@ function buildNestedNotExpression(path: string, value: unknown, collector: BindC
   if (!isPlainObject(value) || Object.keys(value).length === 0) {
     throw new Error('$not requires a non-empty object');
   }
+  const options = regexOptions(value);
   return Object.entries(value)
+    .filter(([operator]) => operator !== '$options')
     .map(([operator, operand]) => {
       if (!operator.startsWith('$')) {
         return buildFieldExpression(`${path}.${operator}`, operand, collector);
       }
-      return buildOperatorExpression(path, operator, operand, collector);
+      return buildOperatorExpression(path, operator, operand, collector, options);
     })
     .join(' AND ');
 }
@@ -167,10 +182,13 @@ function buildInExpression(path: string, value: unknown, collector: BindCollecto
   }
 
   const placeholders = values.map(item => bind(collector, item)).join(', ');
-  const scalarExpression = `${jsonValue(path, values[0])} ${negate ? 'NOT ' : ''}IN (${placeholders})`;
+  const scalar = jsonValue(path, values[0]);
+  const scalarExpression = `${scalar} ${negate ? 'NOT ' : ''}IN (${placeholders})`;
   const arrayExpressions = values.map(item => jsonArrayContains(path, item, collector));
   const arrayExpression = arrayExpressions.length ? arrayExpressions.join(' OR ') : '1 = 0';
-  return negate ? `(${scalarExpression} AND NOT (${arrayExpression}))` : `(${scalarExpression} OR ${arrayExpression})`;
+  return negate
+    ? `(${jsonNullCondition(path, true)} AND (${scalarExpression} OR ${scalar} IS NULL) AND NOT (${arrayExpression}))`
+    : `(${scalarExpression} OR ${arrayExpression})`;
 }
 
 function buildAllExpression(path: string, value: unknown, collector: BindCollector): string {
@@ -249,9 +267,23 @@ function elemMatchCondition(
   }
 }
 
-// Regex binds the pattern and only emits Oracle's case-insensitive flag when requested.
+function regexOptions(value: Record<string, unknown>): string {
+  if ('$options' in value && !('$regex' in value)) throw new Error('$options requires $regex');
+  const options = value.$options;
+  if (options !== undefined && typeof options !== 'string') throw new Error('$options must be a string');
+  return options ?? '';
+}
+
+// Map common regex flags to Oracle match parameters. Unicode matching is native;
+// non-matching flags such as JavaScript's global flag retain their existing behavior.
 function buildRegexExpression(path: string, pattern: string, flags: string, collector: BindCollector): string {
-  const matchParameter = flags.includes('i') || pattern.startsWith('(?i)') ? `, 'i'` : '';
+  const parameters = [
+    flags.includes('i') || pattern.startsWith('(?i)') ? 'i' : '',
+    flags.includes('m') ? 'm' : '',
+    flags.includes('s') ? 'n' : '',
+    flags.includes('x') ? 'x' : '',
+  ].join('');
+  const matchParameter = parameters ? `, '${parameters}'` : '';
   const normalizedPattern = pattern.startsWith('(?i)') ? pattern.slice(4) : pattern;
   const name = collector.add(normalizedPattern);
   return `REGEXP_LIKE(${jsonValue(path, '')}, :${name}${matchParameter})`;
@@ -288,6 +320,15 @@ function jsonValue(path: string, comparisonValue: unknown): string {
     return `JSON_VALUE(metadata, '${jsonPath}' RETURNING NUMBER NULL ON ERROR)`;
   }
   return `JSON_VALUE(metadata, '${jsonPath}' RETURNING VARCHAR2(4000) NULL ON ERROR)`;
+}
+
+function jsonNullCondition(path: string, negate = false): string {
+  // JSON_VALUE also returns SQL NULL for arrays, objects, and empty strings.
+  // Preserve JSON types so only missing properties and JSON null match $eq: null.
+  const json = `JSON_QUERY(metadata, '${assertJsonPath(path)}' RETURNING CLOB WITH WRAPPER NULL ON ERROR)`;
+  return negate
+    ? `(${json} IS NOT NULL AND NOT JSON_EQUAL(${json}, '[null]'))`
+    : `(${json} IS NULL OR JSON_EQUAL(${json}, '[null]'))`;
 }
 
 function jsonArrayContains(path: string, value: unknown, collector: BindCollector): string {

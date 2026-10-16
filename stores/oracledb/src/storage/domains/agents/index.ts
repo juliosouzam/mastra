@@ -5,6 +5,7 @@ import {
   normalizePerPage,
   TABLE_AGENTS,
   TABLE_AGENT_VERSIONS,
+  TABLE_FAVORITES,
   TABLE_SCHEMAS,
 } from '@mastra/core/storage';
 import type {
@@ -23,10 +24,16 @@ import type {
 } from '@mastra/core/storage/domains/agents';
 
 import { clobBind, jsonBind, nullableClobBind, nullableJsonBind, safeJsonValue } from '../../../shared/connection';
-import { assertJsonPath, indexNameForTable, qualifyName } from '../../../vector/identifiers';
+import { indexNameForTable, qualifyName } from '../../../vector/identifiers';
 import { OracleDB, createOracleIndex, filterIndexesForTables, parseOracleJson } from '../../db';
 import type { OracleCreateIndexOptions, OracleTxClient } from '../../db';
-import { createOracleStorageError, parseOptionalJson, parseOptionalJsonObject, toDate } from '../../domain-utils';
+import {
+  buildOracleJsonContains,
+  createOracleStorageError,
+  parseOptionalJson,
+  parseOptionalJsonObject,
+  toDate,
+} from '../../domain-utils';
 import type { OracleDomainConfig } from '../../types';
 
 // Agents are versioned registry records: the parent row supports listing and lifecycle state while version rows preserve editable snapshots.
@@ -41,6 +48,8 @@ const VERSION_AGENT_ID = '"agentId"';
 const VERSION_VERSION_NUMBER = '"versionNumber"';
 const VERSION_DEFAULT_OPTIONS = '"defaultOptions"';
 const VERSION_INTEGRATION_TOOLS = '"integrationTools"';
+const VERSION_TOOL_PROVIDERS = '"toolProviders"';
+const VERSION_SKILLS_FORMAT = '"skillsFormat"';
 const VERSION_INPUT_PROCESSORS = '"inputProcessors"';
 const VERSION_OUTPUT_PROCESSORS = '"outputProcessors"';
 const VERSION_MCP_CLIENTS = '"mcpClients"';
@@ -56,6 +65,7 @@ type AgentRow = {
   authorId?: string | null;
   visibility?: StorageAgentType['visibility'] | null;
   metadata?: unknown;
+  metadataJson?: string | null;
   favoriteCount?: number | string | null;
   createdAt: Date | string;
   updatedAt: Date | string;
@@ -74,12 +84,17 @@ type AgentVersionRow = {
   workflows?: unknown;
   agents?: unknown;
   integrationTools?: unknown;
+  toolProviders?: unknown;
   inputProcessors?: unknown;
   outputProcessors?: unknown;
   memory?: unknown;
   scorers?: unknown;
   mcpClients?: unknown;
   requestContextSchema?: unknown;
+  workspace?: unknown;
+  skills?: unknown;
+  skillsFormat?: AgentVersion['skillsFormat'] | null;
+  durable?: unknown;
   browser?: unknown;
   changedFields?: unknown;
   changeMessage?: string | null;
@@ -88,11 +103,7 @@ type AgentVersionRow = {
 
 type VersionWriteClient = Pick<OracleTxClient, 'none'>;
 
-const ORACLE_AGENT_VERSIONS_SCHEMA = Object.fromEntries(
-  Object.entries(TABLE_SCHEMAS[TABLE_AGENT_VERSIONS]).filter(([column]) => {
-    return column !== 'workspace' && !column.startsWith('skill');
-  }),
-);
+const ORACLE_AGENT_VERSIONS_SCHEMA = TABLE_SCHEMAS[TABLE_AGENT_VERSIONS];
 
 export { ORACLE_AGENT_VERSIONS_SCHEMA };
 
@@ -107,7 +118,29 @@ export class AgentsOracle extends AgentsStorage {
 
   constructor(config: OracleDomainConfig) {
     super();
-    this.db = new OracleDB(config);
+    this.db = new OracleDB({
+      ...config,
+      jsonColumns: [
+        'model',
+        'tools',
+        'defaultOptions',
+        'workflows',
+        'agents',
+        'integrationTools',
+        'toolProviders',
+        'inputProcessors',
+        'outputProcessors',
+        'memory',
+        'scorers',
+        'mcpClients',
+        'requestContextSchema',
+        'workspace',
+        'skills',
+        'durable',
+        'browser',
+        'changedFields',
+      ],
+    });
     this.schemaName = config.schemaName;
     this.skipDefaultIndexes = config.skipDefaultIndexes;
     this.indexes = filterIndexesForTables(config.indexes, AgentsOracle.MANAGED_TABLES);
@@ -137,6 +170,11 @@ export class AgentsOracle extends AgentsStorage {
         'requestContextSchema',
         'browser',
         'integrationTools',
+        'toolProviders',
+        'workspace',
+        'skills',
+        'skillsFormat',
+        'durable',
         'inputProcessors',
         'outputProcessors',
       ],
@@ -160,8 +198,12 @@ export class AgentsOracle extends AgentsStorage {
   }
 
   async getById(id: string): Promise<StorageAgentType | null> {
+    return this.getByIdWithClient(this.db.read, id);
+  }
+
+  private async getByIdWithClient(client: OracleDB, id: string): Promise<StorageAgentType | null> {
     try {
-      const row = await this.db.oneOrNone<AgentRow>(
+      const row = await client.oneOrNone<AgentRow>(
         `${this.agentSelect()} FROM ${this.table(TABLE_AGENTS)} WHERE id = :id`,
         { id },
       );
@@ -241,7 +283,7 @@ export class AgentsOracle extends AgentsStorage {
     const { id, ...updates } = input;
 
     try {
-      const existingAgent = await this.getById(id);
+      const existingAgent = await this.getByIdWithClient(this.db, id);
       if (!existingAgent) {
         throw new Error(`Agent with id ${id} not found`);
       }
@@ -282,7 +324,7 @@ export class AgentsOracle extends AgentsStorage {
 
       await this.db.none(`UPDATE ${this.table(TABLE_AGENTS)} SET ${setClauses.join(', ')} WHERE id = :id`, binds);
 
-      const updatedAgent = await this.getById(id);
+      const updatedAgent = await this.getByIdWithClient(this.db, id);
       if (!updatedAgent) {
         throw new Error(`Agent with id ${id} not found after update`);
       }
@@ -314,6 +356,7 @@ export class AgentsOracle extends AgentsStorage {
       metadata,
       status,
       entityIds,
+      pinFavoritedFor,
       favoritedOnly,
     } = args || {};
 
@@ -344,11 +387,16 @@ export class AgentsOracle extends AgentsStorage {
         visibility,
         metadata,
         entityIds,
+        pinFavoritedFor,
         favoritedOnly,
       });
+      const favoritesJoin = pinFavoritedFor
+        ? `LEFT JOIN ${this.table(TABLE_FAVORITES)} f ON f."entityType" = 'agent' AND f."entityId" = a.id AND f."userId" = :favoriteUser`
+        : '';
+      if (pinFavoritedFor) binds.favoriteUser = pinFavoritedFor;
 
-      const countRow = await this.db.oneOrNone<{ count: number | string }>(
-        `SELECT COUNT(*) AS "count" FROM ${this.table(TABLE_AGENTS)} a ${whereClause}`,
+      const countRow = await this.db.read.oneOrNone<{ count: number | string }>(
+        `SELECT COUNT(*) AS "count" FROM ${this.table(TABLE_AGENTS)} a ${favoritesJoin} ${whereClause}`,
         binds,
       );
       const total = Number(countRow?.count ?? 0);
@@ -375,11 +423,12 @@ export class AgentsOracle extends AgentsStorage {
 
       const limit = perPageInput === false ? total : perPage;
       const orderByParts: string[] = [];
+      if (pinFavoritedFor) orderByParts.push('CASE WHEN f."userId" IS NULL THEN 1 ELSE 0 END');
       orderByParts.push(`a.${this.agentOrderColumn(field)} ${direction}`);
       orderByParts.push(`a.id ASC`);
 
-      const rows = await this.db.manyOrNone<AgentRow>(
-        `${this.agentSelect('a')} FROM ${this.table(TABLE_AGENTS)} a ${whereClause} ORDER BY ${orderByParts.join(
+      const rows = await this.db.read.manyOrNone<AgentRow>(
+        `${this.agentSelect('a')} FROM ${this.table(TABLE_AGENTS)} a ${favoritesJoin} ${whereClause} ORDER BY ${orderByParts.join(
           ', ',
         )} OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY`,
         { ...binds, offset, limit },
@@ -439,7 +488,7 @@ export class AgentsOracle extends AgentsStorage {
 
   async getVersion(id: string): Promise<AgentVersion | null> {
     try {
-      const row = await this.db.oneOrNone<AgentVersionRow>(
+      const row = await this.db.read.oneOrNone<AgentVersionRow>(
         `${this.versionSelect()} FROM ${this.table(TABLE_AGENT_VERSIONS)} WHERE id = :id`,
         { id },
       );
@@ -451,7 +500,7 @@ export class AgentsOracle extends AgentsStorage {
 
   async getVersionByNumber(agentId: string, versionNumber: number): Promise<AgentVersion | null> {
     try {
-      const row = await this.db.oneOrNone<AgentVersionRow>(
+      const row = await this.db.read.oneOrNone<AgentVersionRow>(
         `${this.versionSelect()} FROM ${this.table(
           TABLE_AGENT_VERSIONS,
         )} WHERE ${VERSION_AGENT_ID} = :agentId AND ${VERSION_VERSION_NUMBER} = :versionNumber`,
@@ -465,7 +514,7 @@ export class AgentsOracle extends AgentsStorage {
 
   async getLatestVersion(agentId: string): Promise<AgentVersion | null> {
     try {
-      const row = await this.db.oneOrNone<AgentVersionRow>(
+      const row = await this.db.read.oneOrNone<AgentVersionRow>(
         `${this.versionSelect()} FROM ${this.table(
           TABLE_AGENT_VERSIONS,
         )} WHERE ${VERSION_AGENT_ID} = :agentId ORDER BY ${VERSION_VERSION_NUMBER} DESC FETCH FIRST 1 ROWS ONLY`,
@@ -491,7 +540,7 @@ export class AgentsOracle extends AgentsStorage {
 
     try {
       const { field, direction } = this.parseVersionOrderBy(orderBy);
-      const countRow = await this.db.oneOrNone<{ count: number | string }>(
+      const countRow = await this.db.read.oneOrNone<{ count: number | string }>(
         `SELECT COUNT(*) AS "count" FROM ${this.table(TABLE_AGENT_VERSIONS)} WHERE ${VERSION_AGENT_ID} = :agentId`,
         { agentId },
       );
@@ -520,7 +569,7 @@ export class AgentsOracle extends AgentsStorage {
       const limit = perPageInput === false ? total : perPage;
       // `id ASC` breaks ties between versions sharing the same order-by value so
       // pages stay stable instead of duplicating or dropping rows across pages.
-      const rows = await this.db.manyOrNone<AgentVersionRow>(
+      const rows = await this.db.read.manyOrNone<AgentVersionRow>(
         `${this.versionSelect()} FROM ${this.table(
           TABLE_AGENT_VERSIONS,
         )} WHERE ${VERSION_AGENT_ID} = :agentId ORDER BY ${this.versionOrderColumn(
@@ -571,7 +620,7 @@ export class AgentsOracle extends AgentsStorage {
 
   async countVersions(agentId: string): Promise<number> {
     try {
-      const row = await this.db.oneOrNone<{ count: number | string }>(
+      const row = await this.db.read.oneOrNone<{ count: number | string }>(
         `SELECT COUNT(*) AS "count" FROM ${this.table(TABLE_AGENT_VERSIONS)} WHERE ${VERSION_AGENT_ID} = :agentId`,
         { agentId },
       );
@@ -595,12 +644,17 @@ export class AgentsOracle extends AgentsStorage {
       workflows: input.workflows,
       agents: input.agents,
       integrationTools: input.integrationTools,
+      toolProviders: input.toolProviders,
       inputProcessors: input.inputProcessors,
       outputProcessors: input.outputProcessors,
       memory: input.memory,
       scorers: input.scorers,
       mcpClients: input.mcpClients,
       requestContextSchema: input.requestContextSchema,
+      workspace: input.workspace,
+      skills: input.skills,
+      skillsFormat: input.skillsFormat,
+      durable: input.durable,
       browser: input.browser,
       changedFields: input.changedFields,
       changeMessage: input.changeMessage,
@@ -610,13 +664,13 @@ export class AgentsOracle extends AgentsStorage {
 
   private async createIndexes(): Promise<void> {
     await this.db.withConnection(async connection => {
-      if (!this.skipDefaultIndexes) {
-        for (const index of this.getDefaultIndexDefinitions()) {
-          try {
-            await createOracleIndex(connection, index, this.schemaName);
-          } catch (error) {
-            this.logger?.warn?.(`Failed to create Oracle default index ${index.name}:`, error);
-          }
+      for (const index of this.getDefaultIndexDefinitions()) {
+        if (this.skipDefaultIndexes && !index.unique) continue;
+        try {
+          await createOracleIndex(connection, index, this.schemaName);
+        } catch (error) {
+          if (index.unique) throw error;
+          this.logger?.warn?.(`Failed to create Oracle default index ${index.name}:`, error);
         }
       }
 
@@ -640,17 +694,19 @@ export class AgentsOracle extends AgentsStorage {
     await client.none(
       `INSERT INTO ${this.table(TABLE_AGENT_VERSIONS)} (
         id, ${VERSION_AGENT_ID}, ${VERSION_VERSION_NUMBER},
-        name, description, instructions, model, tools,
+        name, description, instructions, model, tools, ${VERSION_TOOL_PROVIDERS},
         ${VERSION_DEFAULT_OPTIONS}, workflows, agents, ${VERSION_INTEGRATION_TOOLS},
         ${VERSION_INPUT_PROCESSORS}, ${VERSION_OUTPUT_PROCESSORS}, memory, scorers,
         ${VERSION_MCP_CLIENTS}, ${VERSION_REQUEST_CONTEXT_SCHEMA},
+        workspace, skills, ${VERSION_SKILLS_FORMAT}, durable,
         browser, ${VERSION_CHANGED_FIELDS}, ${VERSION_CHANGE_MESSAGE}, ${VERSION_CREATED_AT}
       ) VALUES (
         :id, :agentId, :versionNumber,
-        :name, :description, :instructions, :model, :tools,
+        :name, :description, :instructions, :model, :tools, :toolProviders,
         :defaultOptions, :workflows, :agents, :integrationTools,
         :inputProcessors, :outputProcessors, :memory, :scorers,
         :mcpClients, :requestContextSchema,
+        :workspace, :skills, :skillsFormat, :durable,
         :browser, :changedFields, :changeMessage, :createdAt
       )`,
       {
@@ -666,12 +722,17 @@ export class AgentsOracle extends AgentsStorage {
         workflows: nullableJsonBind(input.workflows),
         agents: nullableJsonBind(input.agents),
         integrationTools: nullableJsonBind(input.integrationTools),
+        toolProviders: nullableJsonBind(input.toolProviders),
         inputProcessors: nullableJsonBind(input.inputProcessors),
         outputProcessors: nullableJsonBind(input.outputProcessors),
         memory: nullableJsonBind(input.memory),
         scorers: nullableJsonBind(input.scorers),
         mcpClients: nullableJsonBind(input.mcpClients),
         requestContextSchema: nullableJsonBind(input.requestContextSchema),
+        workspace: nullableJsonBind(input.workspace),
+        skills: nullableJsonBind(input.skills),
+        skillsFormat: input.skillsFormat ?? null,
+        durable: nullableJsonBind(input.durable),
         browser: nullableJsonBind(input.browser),
         changedFields: nullableJsonBind(input.changedFields),
         changeMessage: nullableClobBind(input.changeMessage),
@@ -686,6 +747,7 @@ export class AgentsOracle extends AgentsStorage {
     visibility?: StorageAgentType['visibility'];
     metadata?: Record<string, unknown>;
     entityIds?: string[];
+    pinFavoritedFor?: string;
     favoritedOnly?: boolean;
   }): { whereClause: string; binds: Record<string, unknown> } {
     const conditions: string[] = [];
@@ -707,14 +769,9 @@ export class AgentsOracle extends AgentsStorage {
     }
 
     if (args.metadata && Object.keys(args.metadata).length > 0) {
-      let index = 0;
-      for (const [key, value] of Object.entries(args.metadata)) {
-        const bindName = `metadata${index++}`;
-        // Metadata filters are translated into JSON_VALUE predicates so Oracle
-        // can use function-based indexes for common scalar fields.
-        conditions.push(`${jsonValue('a.metadata', key, value)} = :${bindName}`);
-        binds[bindName] = jsonComparableValue(value);
-      }
+      const metadata = buildOracleJsonContains('a.metadata', args.metadata);
+      conditions.push(metadata.sql);
+      Object.assign(binds, metadata.binds);
     }
 
     if (args.entityIds && args.entityIds.length > 0) {
@@ -727,7 +784,7 @@ export class AgentsOracle extends AgentsStorage {
     }
 
     if (args.favoritedOnly) {
-      conditions.push('1 = 0');
+      conditions.push(args.pinFavoritedFor ? 'f."userId" IS NOT NULL' : '1 = 0');
     }
 
     return {
@@ -744,7 +801,7 @@ export class AgentsOracle extends AgentsStorage {
       `${prefix}${AGENT_ACTIVE_VERSION_ID} AS "activeVersionId"`,
       `${prefix}${AGENT_AUTHOR_ID} AS "authorId"`,
       `${prefix}visibility AS "visibility"`,
-      `${prefix}metadata AS "metadata"`,
+      `JSON_SERIALIZE(${prefix}metadata RETURNING CLOB) AS "metadataJson"`,
       `${prefix}${AGENT_FAVORITE_COUNT} AS "favoriteCount"`,
       `${prefix}${AGENT_CREATED_AT} AS "createdAt"`,
       `${prefix}${AGENT_UPDATED_AT} AS "updatedAt"`,
@@ -759,20 +816,25 @@ export class AgentsOracle extends AgentsStorage {
       `name AS "name"`,
       `description AS "description"`,
       `instructions AS "instructions"`,
-      `model AS "model"`,
-      `tools AS "tools"`,
-      `${VERSION_DEFAULT_OPTIONS} AS "defaultOptions"`,
-      `workflows AS "workflows"`,
-      `agents AS "agents"`,
-      `${VERSION_INTEGRATION_TOOLS} AS "integrationTools"`,
-      `${VERSION_INPUT_PROCESSORS} AS "inputProcessors"`,
-      `${VERSION_OUTPUT_PROCESSORS} AS "outputProcessors"`,
-      `memory AS "memory"`,
-      `scorers AS "scorers"`,
-      `${VERSION_MCP_CLIENTS} AS "mcpClients"`,
-      `${VERSION_REQUEST_CONTEXT_SCHEMA} AS "requestContextSchema"`,
-      `browser AS "browser"`,
-      `${VERSION_CHANGED_FIELDS} AS "changedFields"`,
+      `JSON_SERIALIZE(model RETURNING CLOB) AS "model"`,
+      `JSON_SERIALIZE(tools RETURNING CLOB) AS "tools"`,
+      `JSON_SERIALIZE(${VERSION_DEFAULT_OPTIONS} RETURNING CLOB) AS "defaultOptions"`,
+      `JSON_SERIALIZE(workflows RETURNING CLOB) AS "workflows"`,
+      `JSON_SERIALIZE(agents RETURNING CLOB) AS "agents"`,
+      `JSON_SERIALIZE(${VERSION_INTEGRATION_TOOLS} RETURNING CLOB) AS "integrationTools"`,
+      `JSON_SERIALIZE(${VERSION_TOOL_PROVIDERS} RETURNING CLOB) AS "toolProviders"`,
+      `JSON_SERIALIZE(${VERSION_INPUT_PROCESSORS} RETURNING CLOB) AS "inputProcessors"`,
+      `JSON_SERIALIZE(${VERSION_OUTPUT_PROCESSORS} RETURNING CLOB) AS "outputProcessors"`,
+      `JSON_SERIALIZE(memory RETURNING CLOB) AS "memory"`,
+      `JSON_SERIALIZE(scorers RETURNING CLOB) AS "scorers"`,
+      `JSON_SERIALIZE(${VERSION_MCP_CLIENTS} RETURNING CLOB) AS "mcpClients"`,
+      `JSON_SERIALIZE(${VERSION_REQUEST_CONTEXT_SCHEMA} RETURNING CLOB) AS "requestContextSchema"`,
+      `JSON_SERIALIZE(workspace RETURNING CLOB) AS "workspace"`,
+      `JSON_SERIALIZE(skills RETURNING CLOB) AS "skills"`,
+      `${VERSION_SKILLS_FORMAT} AS "skillsFormat"`,
+      `JSON_SERIALIZE(durable RETURNING CLOB) AS "durable"`,
+      `JSON_SERIALIZE(browser RETURNING CLOB) AS "browser"`,
+      `JSON_SERIALIZE(${VERSION_CHANGED_FIELDS} RETURNING CLOB) AS "changedFields"`,
       `${VERSION_CHANGE_MESSAGE} AS "changeMessage"`,
       `${VERSION_CREATED_AT} AS "createdAt"`,
     ].join(', ');
@@ -785,7 +847,7 @@ export class AgentsOracle extends AgentsStorage {
       activeVersionId: optionalString(row.activeVersionId),
       authorId: optionalString(row.authorId),
       visibility: optionalVisibility(row.visibility),
-      metadata: parseOptionalJsonObject(row.metadata),
+      metadata: parseOptionalJsonObject(row.metadataJson ?? row.metadata),
       favoriteCount: row.favoriteCount === null || row.favoriteCount === undefined ? 0 : Number(row.favoriteCount),
       createdAt: toDate(row.createdAt),
       updatedAt: toDate(row.updatedAt),
@@ -808,12 +870,17 @@ export class AgentsOracle extends AgentsStorage {
       workflows: parseOptionalJson<AgentVersion['workflows']>(row.workflows),
       agents: parseOptionalJson<AgentVersion['agents']>(row.agents),
       integrationTools: parseOptionalJson<AgentVersion['integrationTools']>(row.integrationTools),
+      toolProviders: parseOptionalJson<AgentVersion['toolProviders']>(row.toolProviders),
       inputProcessors: parseOptionalJson<AgentVersion['inputProcessors']>(row.inputProcessors),
       outputProcessors: parseOptionalJson<AgentVersion['outputProcessors']>(row.outputProcessors),
       memory: parseOptionalJson<AgentVersion['memory']>(row.memory),
       scorers: parseOptionalJson<AgentVersion['scorers']>(row.scorers),
       mcpClients: parseOptionalJson<AgentVersion['mcpClients']>(row.mcpClients),
       requestContextSchema: parseOptionalJson<AgentVersion['requestContextSchema']>(row.requestContextSchema),
+      workspace: parseOptionalJson<AgentVersion['workspace']>(row.workspace),
+      skills: parseOptionalJson<AgentVersion['skills']>(row.skills),
+      skillsFormat: row.skillsFormat ?? undefined,
+      durable: parseOptionalJson<AgentVersion['durable']>(row.durable),
       browser: parseOptionalJson<AgentVersion['browser']>(row.browser),
       changedFields: parseOptionalJson<AgentVersion['changedFields']>(row.changedFields),
       changeMessage: optionalString(row.changeMessage),
@@ -948,20 +1015,4 @@ function normalizeLegacyTools(value: unknown): unknown {
 
 function isLegacyToolArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every(item => typeof item === 'string');
-}
-
-function jsonValue(column: string, path: string, comparisonValue: unknown): string {
-  const jsonPath = assertJsonPath(path);
-  if (typeof comparisonValue === 'number') {
-    return `JSON_VALUE(${column}, '${jsonPath}' RETURNING NUMBER NULL ON ERROR)`;
-  }
-  return `JSON_VALUE(${column}, '${jsonPath}' RETURNING VARCHAR2(4000) NULL ON ERROR)`;
-}
-
-function jsonComparableValue(value: unknown): unknown {
-  if (value instanceof Date) return value.toISOString();
-  if (typeof value === 'boolean') return String(value);
-  if (value === null || value === undefined) return '';
-  if (typeof value === 'object') return JSON.stringify(safeJsonValue(value));
-  return value;
 }

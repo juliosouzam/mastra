@@ -1,15 +1,15 @@
 ---
-title: "OracleDB | Database"
-description: "Persist Mastra memory, workflows, observability, scores, MCP metadata, and agent registry data in Oracle Database with OracleStore."
+title: 'OracleDB | Database'
+description: 'Persist Mastra memory, workflows, observability, scores, MCP metadata, and agent registry data in Oracle Database with OracleStore.'
 packages:
-  - "@mastra/core"
-  - "@mastra/memory"
-  - "@mastra/oracledb"
+  - '@mastra/core'
+  - '@mastra/memory'
+  - '@mastra/oracledb'
 ---
 
 # OracleDB
 
-The OracleDB storage provider stores Mastra application state in Oracle Database. It implements Mastra's composite storage interface, so one `OracleStore` instance can back memory, workflow snapshots, observability, scores, scorer definitions, MCP client metadata, and agent registry data.
+The OracleDB storage provider stores Mastra application state in Oracle Database. It implements Mastra's composite storage interface for conversation history, workflow state, observability, evaluation, runtime tasks, and versioned agent configuration. Knowledge V2 is available through explicit activation.
 
 ## Installation
 
@@ -80,6 +80,19 @@ export const mastra = new Mastra({
     type: 'OraclePoolManager',
     description:
       'Shared Oracle pool manager. Use this to share one Oracle pool between `OracleStore` and `OracleVector`.',
+    isOptional: true,
+  },
+  {
+    name: 'readPool',
+    type: 'oracledb.Pool',
+    description:
+      'Optional caller-owned replica pool. Plain reads use it; schema work, transactions, and mutation checks use the writer.',
+    isOptional: true,
+  },
+  {
+    name: 'readPoolManager',
+    type: 'OraclePoolManager',
+    description: 'Optional caller-owned replica manager. Takes precedence over readPool.',
     isOptional: true,
   },
   {
@@ -160,6 +173,13 @@ export const mastra = new Mastra({
     type: 'OracleCreateIndexOptions[]',
     description:
       'Custom Oracle index definitions to create during initialization. Indexes are routed to the storage domain that owns the target table.',
+    isOptional: true,
+  },
+  {
+    name: 'retention',
+    type: 'RetentionConfig',
+    description:
+      'Optional age-based retention policies. Call storage.prune() to apply them; data without a policy is retained.',
     isOptional: true,
   },
   {
@@ -249,6 +269,44 @@ Use `invisible` for staged rollout, then remove it after validating query plans.
 
 Use `disableInit: true` when schema changes are applied by a separate deployment step or by a database administrator.
 
+## Advanced observability
+
+Use `OracleStoreVNext` for metrics, feedback, span and trace queries, trace aggregates, thread queries, previews, and delta polling. It replaces the observability domain while keeping the same application storage domains. `OracleStore` retains its existing observability behavior.
+
+Provide an explicit observability connection. Use a dedicated database for observability when its writes and aggregate queries would compete with application traffic:
+
+```ts
+import { OracleStoreVNext } from '@mastra/oracledb'
+
+const storage = new OracleStoreVNext({
+  id: 'oracle-storage',
+  user: process.env.ORACLE_DATABASE_USER,
+  password: process.env.ORACLE_DATABASE_PASSWORD,
+  connectString: process.env.ORACLE_DATABASE_CONNECT_STRING,
+  observability: {
+    user: process.env.ORACLE_OBSERVABILITY_USER,
+    password: process.env.ORACLE_OBSERVABILITY_PASSWORD,
+    connectString: process.env.ORACLE_OBSERVABILITY_CONNECT_STRING,
+    traceQueryTimeoutMs: 15_000,
+    discovery: { ttlSeconds: 300, lookbackSeconds: 2_592_000 },
+  },
+})
+```
+
+The observability user needs `EXECUTE ON SYS.DBMS_FLASHBACK` in addition to the usual schema privileges. Have a database administrator grant it to that user:
+
+```sql
+GRANT EXECUTE ON SYS.DBMS_FLASHBACK TO MASTRA_OBSERVABILITY;
+```
+
+The adapter combines commit SCNs with sequence values for polling. `ROWDEPENDENCIES` adds six bytes per row and lets Oracle track changes at row level. A transaction that commits late is still included even if it reserved a lower sequence value. Queries requiring a consistent count and page use one transaction snapshot. The Oracle implementation uses `SERIALIZABLE` for these read operations so queries also work immediately after schema creation. Statement timeouts are restored before returning the connection to its pool.
+
+Advanced observability uses separate `MASTRA_OBS_*` tables, so it can coexist with legacy observability in one schema. Existing traces stay in their original tables. The new tables use native JSON and UTC timestamp indexes. Spans and feedback also store normalized word projections to support the Mastra text-search contract; these projections add storage and write work. This mode uses ordinary tables and bounded row deletion for retention. Retention cost grows with the number of rows deleted.
+
+The observability configuration accepts its own `schemaName`, `pool`, `poolManager`, `skipDefaultIndexes`, and `indexes`. Its schema defaults to that connection's user. Required identity indexes are created even with default performance indexes disabled. Discovery caches values for five minutes and scans the last 30 days by default; set `lookbackSeconds: 0` to scan all retained events.
+
+Export its schema separately with `exportSchemas({ schemaName: 'MASTRA_OBSERVABILITY', domains: ['observabilityVNext'] })`. Configure retention through the existing `observability` domain, using `spans`, `logs`, `metrics`, `scores`, and `feedback` policies.
+
 ## Schema export
 
 Use `exportSchemas()` to generate Oracle DDL without connecting to a database. This is useful when schema changes are reviewed or applied outside application startup.
@@ -266,13 +324,295 @@ const ddl = exportSchemas({
     'scorerDefinitions',
     'mcpClients',
     'agents',
+    'threadState',
   ],
 })
 
 console.log(ddl)
 ```
 
-`domains` defaults to every supported domain, including `vector`, when omitted.
+When `domains` is omitted, the export includes the default application domains and `vector`. Export `knowledge` and `observabilityVNext` explicitly when using those modes.
+
+The exported schema includes the ownership records required by workflows and memory writes.
+
+## Memory updates
+
+Oracle supports atomic working-memory updates across processes. Use `mergeResourceWorkingMemory()` when several runs can update the same resource. The callback receives the current value while the resource is locked; a failed callback rolls back the update.
+
+```ts
+await storage.init()
+const memory = await storage.getStore('memory')
+if (!memory) throw new Error('Memory storage is unavailable')
+
+await memory.mergeResourceWorkingMemory({
+  resourceId: 'customer-123',
+  merge: existing => [existing, 'Prefers Portuguese.'].filter(Boolean).join('\n'),
+})
+```
+
+For message reads that only need a page and `hasMore`, pass `includeTotal: false` to `listMessages()` or `listMessagesByResourceId()`. This avoids counting the full history. The returned `total` isn't a full count in this mode.
+
+## Retention
+
+Set age limits for conversation data, workflow snapshots, or evaluation scores, then call `storage.prune()` from your scheduler:
+
+```ts
+import { OracleStore } from '@mastra/oracledb'
+
+const storage = new OracleStore({
+  id: 'oracle-storage',
+  user: process.env.ORACLE_DATABASE_USER,
+  password: process.env.ORACLE_DATABASE_PASSWORD,
+  connectString: process.env.ORACLE_DATABASE_CONNECT_STRING,
+  retention: {
+    memory: { messages: { maxAge: '30d', batchSize: 500 } },
+    workflows: { workflowSnapshot: { maxAge: '90d' } },
+    scores: { scorers: { maxAge: '90d' } },
+    threadState: { threadState: { maxAge: '90d' } },
+  },
+})
+
+await storage.init()
+const results = await storage.prune({ maxBatches: 10 })
+```
+
+Retention also supports memory `threads`, `resources`, and retired `runFences`; workflow `runOwnership`; and observability `spans` and `logs`. Tables without a policy are retained. If a result has `done: false`, call `prune()` again to continue.
+
+Message retention also cleans up orphaned semantic-recall vectors discovered through the configured Oracle vector registry. Vectors stored in another service require their own retention policy.
+
+Thread-state retention uses the last update time, so refreshing a task list or goal keeps that state active.
+
+Retention creates its supporting indexes on demand, including when `skipDefaultIndexes` is enabled. If the runtime user can't create an index, pruning continues and logs a warning. Apply the exported indexes with your setup credentials to avoid this overhead.
+
+## Durable thread state
+
+The `threadState` domain persists task lists, goals, and other JSON state by thread and type. Writing a value replaces the previous value for that pair; other threads and types remain independent.
+
+```ts
+const state = await storage.getStore('threadState')
+if (!state) throw new Error('Thread-state storage is unavailable')
+
+await state.setState({
+  threadId: 'thread-123',
+  type: 'task',
+  value: [
+    {
+      id: 'task-1',
+      content: 'Review documents',
+      status: 'pending',
+      activeForm: 'Reviewing documents',
+    },
+  ],
+})
+const tasks = await state.getState({ threadId: 'thread-123', type: 'task' })
+```
+
+`getState()` returns `undefined` when no value exists. JSON primitives, arrays, objects, and `null` retain their types.
+
+## Workflow definitions and artifacts
+
+Use `storage.getStore()` to access these additional domains:
+
+| Domain | Stored data | Behavior |
+| - | - | - |
+| `workflowDefinitions` | Declarative workflow graphs, schemas, metadata, and schedules | Partial upserts preserve omitted fields and creation time. Lists can filter by author or status. Set `schedule: null` to remove a schedule. |
+| `blobs` | Skill file contents keyed by content hash | Existing hashes aren't overwritten. Batch writes commit together; missing hashes are omitted from batch reads. Empty and large files retain their content. |
+| `toolProviderConnections` | Connection labels and identity scope | Keys combine author, provider, and connection. Updating a label preserves creation time and an omitted scope. Labels can be empty or `null`. |
+
+For example, persist a workflow definition for the framework to load:
+
+```ts
+const definitions = await storage.getStore('workflowDefinitions')
+if (!definitions) throw new Error('Workflow definition storage is unavailable')
+
+await definitions.upsert({
+  id: 'stored-workflow',
+  inputSchema: { type: 'object' },
+  outputSchema: { type: 'object' },
+  graph: [],
+  authorId: 'author-123',
+})
+```
+
+These domains are included in `exportSchemas()` and the provider's schema initialization.
+
+## Versioned prompt blocks
+
+The `promptBlocks` domain stores reusable templates with conditional rules and request-context schemas. Creating a block saves a draft and its initial version. Use `createVersion()` for content changes, then update `activeVersionId` and `status` to publish a selected version. Parent updates manage discovery metadata and publication state.
+
+`getByIdResolved()` selects the published version by default, or the latest draft when no version is active. Pass `{ status: 'draft' }` to resolve the latest version or `{ versionId }` to select a historical version. Large templates and empty text fields retain their values.
+
+Version-number uniqueness remains enforced when `skipDefaultIndexes` is enabled. That option skips optional indexes; it doesn't permit duplicate versions for a block.
+
+## Runtime and evaluation storage
+
+`OracleStore` also provides background tasks, channels, notifications, schedules, datasets, and experiments through `getStore()`. Background task ownership and scheduled execution use conditional updates so competing workers cannot both claim the same state transition. Notifications support delivery times, bulk status updates, and coalescing within their thread, agent, resource, source, and kind.
+
+Datasets keep item history and version snapshots, including tool mocks. Experiments support repeated submissions identified by experiment, item, and attempt, and keep reviewer comments when a result is resubmitted. Purging a dataset item scrubs its historical payloads and linked experiment results; a late result submission stays redacted.
+
+MCP servers, workspaces, and skills have versioned storage. Workspace and skill configuration updates create new immutable versions when values change. Favorites are available for agents and skills and participate in their list filters and ordering.
+
+## Application collections
+
+Use `OracleFactoryStorage` when an application needs its own collections alongside Mastra agent state. It implements the existing Factory storage contract and shares the Oracle store's connection pool:
+
+```ts
+import { OracleFactoryStorage } from '@mastra/oracledb'
+
+const applicationStorage = new OracleFactoryStorage({ store: storage })
+
+await applicationStorage.ensureCollections([
+  {
+    name: 'application_settings',
+    columns: {
+      id: { type: 'uuid-pk' },
+      owner: { type: 'text' },
+      settings: { type: 'json' },
+    },
+    uniqueIndexes: [{ name: 'application_settings_owner', columns: ['owner'] }],
+  },
+])
+
+await applicationStorage.ops.upsertOne('application_settings', ['owner'], {
+  owner: 'customer-123',
+  settings: { language: 'pt-BR' },
+})
+```
+
+Collections support equality filters, ordering, keyset pagination, unique constraints, conditional indexes, atomic row updates, and transactions. Schema updates add columns and indexes, allow nullable values, and widen integer columns without replacing existing rows. Closing a wrapper created with `{ store }` leaves the supplied store open.
+
+Collection text uses CLOB storage, with a one-byte prefix that preserves empty strings separately from SQL `NULL`. Text primary keys and indexed text must fit the Oracle `VARCHAR2(4000)` representation, including that prefix; Oracle also limits the combined size of an index key. JSON fields and unindexed text can hold larger values. Ordering and keyset pagination use Oracle's native JSON scalar comparisons. Very large CLOBs can exceed that representation; in that case, the adapter reads the filtered rows and sorts their complete values in application memory. Bound the query's scope for large collections.
+
+`withTransaction(callback, { isolationLevel: 'serializable' })` locks registered application collections for the transaction. This prevents concurrent inserts from violating conditions such as “create only when no matching row exists.” These locks serialize application writes while the callback runs; use short callbacks containing database operations. The lock set excludes Mastra's agent-state tables.
+
+`OracleFactoryStorage.authDatabase()` exposes an Oracle adapter for Better Auth. Install the optional `better-auth` dependency (version 1.7.7 or later in the 1.x line) when using this capability. The adapter loads that dependency only when an authentication instance invokes it. The Mastra Better Auth integration accepts the existing custom-database contract:
+
+```ts
+import { MastraAuthBetterAuth } from '@mastra/auth-better-auth'
+
+const auth = new MastraAuthBetterAuth({ secret: process.env.BETTER_AUTH_SECRET })
+await auth.init({
+  database: applicationStorage.authDatabase(),
+  publicUrl: 'https://agents.example.com',
+})
+```
+
+Mastra Factory calls this initialization when you pass the auth provider and application storage to it. Auth tables use the `MASTRA_AUTH_` prefix and share the writer pool. The adapter initializes its own schema, including plugin indexes and additive fields. Better Auth's Kysely migrations don't run for custom adapters. Transactions roll back as a unit; verification-token consumption and guarded counter changes lock and recheck the matching row. These operations also work with a single-connection pool.
+
+The collection limits above also apply to indexed auth fields. When adding a required field with a dynamic default, its initial backfill uses the value evaluated during schema initialization; later writes use Better Auth's normal runtime defaults. Custom model and field names are mapped through Better Auth's adapter factory.
+
+You can replace the built-in auth adapter with `new OracleFactoryStorage({ store: storage, authDatabase })`. The supplied adapter owns its schema and must support the authentication library being used.
+
+The Code SDK and Mastra Factory recognize injected Oracle storage. Provide an `OracleVector` through their `vector` option for Oracle recall search; an injected store doesn't create a vector backend automatically.
+
+## Knowledge
+
+Knowledge V2 provides nodes, facts, mentions, structural scopes, activity history, and a recoverable queue for semantic indexing. Activate it when needed:
+
+```ts
+const knowledge = await storage.getStore('knowledge')
+
+if (!knowledge) throw new Error('Knowledge storage is unavailable')
+
+await knowledge.createNode({
+  name: 'Customer support',
+  kind: 'topic',
+  scope: ['org:example'],
+  description: 'Support policies and procedures.',
+})
+```
+
+Ordinary `storage.init()` leaves Knowledge inactive. When automatic initialization is disabled, call `storage.initKnowledge()` explicitly during deployment. Include `knowledge` in `exportSchemas({ domains: [...] })` to export its tables and version marker; the default export excludes it.
+
+Knowledge checks the existing schema before making changes. It can resume its own interrupted initialization, but an incompatible schema requires an explicit `dangerouslyReset()` call, which deletes Knowledge data. It never resets that data during ordinary startup.
+
+Knowledge mutations use a short database row lock shared within the schema. This preserves node identity and semantic queue ordering across application instances, while serializing Knowledge writes in that schema. Notification coalescing also uses a short table lock to merge concurrent first writes. Account for these costs when sizing write-heavy deployments.
+
+Use `storageIsolationKey` when distinct Knowledge backends cannot be identified from their connection settings, such as externally managed pools or TNS aliases. Give the same physical database and schema the same key across instances.
+
+## Vector search
+
+`OracleVector` uses the same connection options as `OracleStore`. Share the storage pool to search embeddings without creating another pool:
+
+```ts
+import { OracleVector } from '@mastra/oracledb'
+
+const vector = new OracleVector({
+  id: 'oracle-vector',
+  poolManager: storage.getPoolManager(),
+})
+
+await vector.createIndex({
+  indexName: 'documents',
+  dimension: 3,
+  vectorFormat: 'halfvec',
+})
+await vector.upsert({
+  indexName: 'documents',
+  namespace: 'project-a',
+  ids: ['document-1'],
+  vectors: [[0.1, 0.2, 0.3]],
+  metadata: [{ title: 'Getting started' }],
+})
+const results = await vector.query({
+  indexName: 'documents',
+  namespace: 'project-a',
+  queryVector: [0.1, 0.2, 0.3],
+  includeVector: true,
+})
+```
+
+### Namespaces and deletion
+
+Each vector operation uses the `default` namespace unless you specify `namespace`. IDs can repeat in different namespaces. Queries, updates, `deleteVector()`, `deleteVectors()`, and upserts with `deleteFilter` only affect the selected namespace. An empty string is a distinct namespace.
+
+Use `deleteVectors({ indexName, namespace })` to clear one namespace. `truncateIndex({ indexName })` removes vectors from **all namespaces** while preserving the index definition. `deleteIndex()` removes the entire index and its table.
+
+### Vector formats
+
+The integration test matrix targets Oracle 23ai 23.9 and Oracle 26ai 23.26.3. Check your database patch level before using sparse vectors or approximate indexes.
+
+| Format | Oracle representation | Behavior |
+| - | - | - |
+| `vector` | Dense `FLOAT32` | Default floating-point embeddings |
+| `halfvec` | Dense `FLOAT32` with values rounded to binary16 precision | Preserves half-precision values; raw coordinates use twice the storage of native 16-bit coordinates |
+| `sparsevec` | Native sparse `FLOAT32` | Accepts dense arrays or `sparseVectors`; supports exact search and HNSW, not IVF |
+| `bit` | Native `BINARY`, padded to whole bytes | Accepts logical dimensions that aren't multiples of eight; returned vectors omit padding |
+| `int8` | Dense `INT8` | Accepts integer coordinates from -128 through 127 |
+
+For sparse-only writes, pass `sparseVectors: [{ indices: [0, 5], values: [1, 0.5] }]` instead of `vectors`. Query the index with `sparseVector: { indices: [0, 5], values: [1, 0.5] }`. The dimension comes from `createIndex()`. Don't combine dense and sparse inputs in the same operation.
+
+### Approximate indexes and scores
+
+Set `indexConfig.type` to `hnsw` or `ivf` for approximate search. HNSW requires configured Oracle Vector Pool memory. Use `buildIndex: false` to load data before building; `buildIndex({ indexName })` retains the requested configuration across provider restarts. Call `rebuildIndex({ indexName, indexConfig })` to change index parameters while preserving stored vectors.
+
+Queries support `ef` for HNSW and `probes` for IVF. These options apply to approximate search, and can't be combined with `targetAccuracy`. Use `queryMode: 'exact'` to compare results against a full search. Unsupported combinations include sparse IVF and Jaccard IVF.
+
+Existing Oracle scores remain the default. Set `scoreMode: 'postgres'` on a query, or `defaultScoreMode: 'postgres'` on the provider, to use PostgreSQL-compatible Hamming normalization and strict score thresholds. Hamming scores then use `1 - distance / logicalDimension`; native Hamming scores use `1 / (1 + distance)`. Native thresholds include equality, while PostgreSQL mode requires `score > minScore`.
+
+Metadata filters support `$regex` with `$options`, including `i`, `m`, `s`, and `x`. Patterns use Oracle's regular expression dialect and limits. `transformFilter()` returns the Oracle SQL predicate and bind parameters for advanced use.
+
+### Index administration
+
+`getIndexInfo({ indexName })` reports the physical index type, count, format, and saved configuration. Parameters for indexes created by an older adapter can be unknown until an explicit rebuild. `getPool()` exposes the Oracle pool; callers borrowing connections must close them.
+
+Set `disableInit: true` when the vector schema is deployed separately. The existing tables must include namespace and registry configuration columns before this mode can query them. Use the provider's schema setup with deployment credentials, or apply the corresponding schema changes before starting the runtime. `exportSchemas({ domains: ['vector'], vector: { indexes: [...] } })` generates DDL for new indexes without connecting to Oracle.
+
+## Read replicas
+
+Set `readPool` or `readPoolManager` to route ordinary storage reads to an Oracle replica. The default uses one pool for all operations. Both connections must expose the same schema and table layout.
+
+```ts
+const storage = new OracleStore({
+  id: 'oracle-storage',
+  pool: writerPool,
+  readPool: replicaPool,
+})
+```
+
+Schema initialization, transactions, mutation validation, and returned mutation results use the writer. Lifecycle reads such as the observational-memory head, thread state, workflow ownership, snapshots and run lookup, due schedules, notification delivery status and due records, dataset-item lookup, individual background tasks, and counts of running tasks also use the writer. Other reads can reflect replica lag. Use `storage.db` for authoritative custom reads and `storage.readDb` for replica reads. `getPool()` returns the writer pool; `getReadPool()` returns the replica, or the writer when none is configured. Caller-provided pools and managers remain open when the store closes.
+
+`OracleStoreVNext` uses its explicit observability connection for all advanced observability operations. It doesn't inherit the application's replica configuration.
 
 ## Operational notes
 

@@ -1,19 +1,10 @@
 export type * from './types';
 
 import { MastraVector } from '@mastra/core/vector';
-import type {
-  DeleteIndexParams,
-  DeleteVectorParams,
-  DeleteVectorsParams,
-  DescribeIndexParams,
-  IndexStats,
-  QueryResult,
-  UpdateVectorParams,
-  UpsertVectorParams,
-} from '@mastra/core/vector';
-import type { Connection } from 'oracledb';
+import type { DeleteIndexParams, DescribeIndexParams, IndexStats, QueryResult } from '@mastra/core/vector';
+import type { BindParameters, Connection, Pool } from 'oracledb';
 
-import { OraclePoolManager, normalizeBatchSize } from '../shared/connection';
+import { OraclePoolManager, asBindParameters, normalizeBatchSize } from '../shared/connection';
 import {
   DEFAULT_METADATA_INDEXES,
   DEFAULT_REGISTRY_TABLE,
@@ -22,9 +13,10 @@ import {
   IndexRegistry,
 } from './ddl';
 import type { CachedIndexInfo } from './ddl';
+import { buildMetadataWhereClause } from './filter';
 import { normalizeIdentifier } from './identifiers';
 import { query as queryOp } from './query';
-import { normalizeVectorFormat } from './sql';
+import { normalizeScoreMode, normalizeVectorFormat } from './sql';
 import {
   configureVectorMemory as configureVectorMemoryOp,
   describeIndex as describeIndexOp,
@@ -36,11 +28,17 @@ import type {
   OracleBuildIndexParams,
   OracleConfigureVectorMemoryParams,
   OracleCreateIndexParams,
+  OracleDeleteVectorParams,
+  OracleDeleteVectorsParams,
   OracleIndexAccuracyParams,
   OracleIndexStatusParams,
+  OracleIndexStats,
   OracleMetric,
   OracleQueryVectorParams,
   OracleRebuildIndexParams,
+  OracleScoreMode,
+  OracleUpsertVectorParams,
+  OracleUpdateVectorParams,
   OracleVectorConfig,
   OracleVectorFilter,
   OracleVectorIndexConfig,
@@ -64,10 +62,11 @@ export class OracleVector extends MastraVector<OracleVectorFilter> {
   private readonly defaultIndexConfig: OracleVectorIndexConfig;
   private readonly upsertBatchSize: number;
   private readonly registry: IndexRegistry;
+  private readonly defaultScoreMode: OracleScoreMode;
 
   constructor(config: OracleVectorConfig) {
     try {
-      super({ id: config.id });
+      super({ id: config.id, disableInit: config.disableInit });
 
       this.poolManager = config.poolManager ?? new OraclePoolManager(config);
       this.ownsPoolManager = !config.poolManager;
@@ -80,6 +79,7 @@ export class OracleVector extends MastraVector<OracleVectorFilter> {
       this.defaultIndexConfig = { type: 'none', accuracy: 95, ...config.defaultIndexConfig };
       const defaultMetadataIndexes = config.defaultMetadataIndexes ?? DEFAULT_METADATA_INDEXES;
       const defaultVectorFormat = normalizeVectorFormat(config.defaultVectorFormat ?? DEFAULT_VECTOR_FORMAT);
+      this.defaultScoreMode = normalizeScoreMode(config.defaultScoreMode);
       this.upsertBatchSize = normalizeBatchSize(
         config.upsertBatchSize,
         'upsertBatchSize',
@@ -93,6 +93,7 @@ export class OracleVector extends MastraVector<OracleVectorFilter> {
         defaultMetadataIndexes,
         defaultVectorFormat,
         defaultIndexConfig: this.defaultIndexConfig,
+        isInitializationDisabled: () => this.disableInit || process.env.MASTRA_DISABLE_STORAGE_INIT === 'true',
       });
     } catch (error) {
       throw asMastraError('INITIALIZATION', 'FAILED', { schemaName: config.schemaName ?? '' }, error);
@@ -115,6 +116,10 @@ export class OracleVector extends MastraVector<OracleVectorFilter> {
     return this.registry.deleteIndex(this.withConnection.bind(this), params);
   }
 
+  async truncateIndex(params: DeleteIndexParams): Promise<void> {
+    return this.registry.truncateIndex(this.withConnection.bind(this), params);
+  }
+
   async configureVectorMemory(params: OracleConfigureVectorMemoryParams): Promise<void> {
     return configureVectorMemoryOp(this.withConnection.bind(this), params);
   }
@@ -127,12 +132,15 @@ export class OracleVector extends MastraVector<OracleVectorFilter> {
     return indexAccuracyQueryOp(this.registry, this.withConnection.bind(this), params);
   }
 
-  async upsert(params: UpsertVectorParams): Promise<string[]> {
+  async upsert(params: OracleUpsertVectorParams): Promise<string[]> {
     return upsertOp(this.registry, this.withConnection.bind(this), this.upsertBatchSize, params);
   }
 
   async query(params: OracleQueryVectorParams): Promise<QueryResult[]> {
-    return queryOp(this.registry, this.withConnection.bind(this), params);
+    return queryOp(this.registry, this.withConnection.bind(this), {
+      ...params,
+      scoreMode: params.scoreMode ?? this.defaultScoreMode,
+    });
   }
 
   async listIndexes(): Promise<string[]> {
@@ -143,15 +151,29 @@ export class OracleVector extends MastraVector<OracleVectorFilter> {
     return describeIndexOp(this.registry, this.withConnection.bind(this), params);
   }
 
-  async updateVector(params: UpdateVectorParams<OracleVectorFilter>): Promise<void> {
+  async getIndexInfo(params: DescribeIndexParams): Promise<OracleIndexStats> {
+    // The existing descriptor returns Oracle details in addition to the generic Mastra fields.
+    return describeIndexOp(this.registry, this.withConnection.bind(this), params) as Promise<OracleIndexStats>;
+  }
+
+  transformFilter(filter?: OracleVectorFilter): { sql: string; binds: BindParameters } {
+    const result = buildMetadataWhereClause(filter);
+    return { sql: result.sql, binds: asBindParameters(result.binds) };
+  }
+
+  async getPool(): Promise<Pool> {
+    return this.poolManager.getPool();
+  }
+
+  async updateVector(params: OracleUpdateVectorParams): Promise<void> {
     return updateVectorOp(this.registry, this.withConnection.bind(this), params);
   }
 
-  async deleteVector(params: DeleteVectorParams): Promise<void> {
+  async deleteVector(params: OracleDeleteVectorParams): Promise<void> {
     return deleteVectorOp(this.registry, this.withConnection.bind(this), params);
   }
 
-  async deleteVectors(params: DeleteVectorsParams<OracleVectorFilter>): Promise<void> {
+  async deleteVectors(params: OracleDeleteVectorsParams): Promise<void> {
     return deleteVectorsOp(this.registry, this.withConnection.bind(this), params);
   }
 

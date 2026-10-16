@@ -1113,6 +1113,7 @@ export class MastraFactory {
     const mastraStorageBackend = (() => {
       for (let proto = Object.getPrototypeOf(storage); proto; proto = Object.getPrototypeOf(proto)) {
         if (proto.constructor?.name === 'PgFactoryStorage') return 'pg' as const;
+        if (proto.constructor?.name === 'OracleFactoryStorage') return 'oracle' as const;
         if (proto.constructor?.name === 'LibSQLFactoryStorage') return 'libsql' as const;
       }
       return undefined;

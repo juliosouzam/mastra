@@ -799,6 +799,13 @@ describe('MastraFactory.prepare', () => {
     expect(config.storageBackend).toBe('pg');
   });
 
+  it('resolves the oracle backend from the FactoryStorage class name', async () => {
+    class OracleFactoryStorage extends LibSQLFactoryStorage {}
+    const storage = new OracleFactoryStorage({ url: ':memory:', id: 'factory-test-oracle-named' });
+    const config = await prepareFactory({ storage });
+    expect(config.storageBackend).toBe('oracle');
+  });
+
   it('keeps the host machine out of every session it mounts', async () => {
     // On the controller, not per session — `createSession` clones
     // `initialState` on every path, webhook recreation included.

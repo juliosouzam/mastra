@@ -48,6 +48,28 @@ async function waitUntil(condition: () => boolean, maxTicks = 50): Promise<void>
 
 // Format names are part of the public OracleVector API and should fail fast on misuse.
 describe('OracleVector format validation', () => {
+  it.each([
+    { type: 'hnsw' as const, hnsw: { neighbors: 1 } },
+    { type: 'hnsw' as const, hnsw: { neighbors: 2049 } },
+    { type: 'hnsw' as const, hnsw: { efConstruction: 65536 } },
+    { type: 'ivf' as const, ivf: { neighborPartitions: 10000001 } },
+  ])('validates deferred index parameter limits before connecting: %j', async indexConfig => {
+    const vector = createVector();
+    await expect(
+      vector.createIndex({ indexName: 'parameter_limits', dimension: 3, buildIndex: false, indexConfig }),
+    ).rejects.toThrow(/positive integer/);
+  });
+
+  it.each([{ ef: 0 }, { probes: -1 }, { ef: Infinity }, { targetAccuracy: 90, probes: 2 }])(
+    'rejects invalid or conflicting search controls %j before connecting',
+    async options => {
+      const vector = createVector();
+      await expect(vector.query({ indexName: 'search_controls', queryVector: [1, 0, 0], ...options })).rejects.toThrow(
+        /ef|probes/,
+      );
+    },
+  );
+
   it('defaults to exact search without a physical vector index', () => {
     const vector = createVector();
 
@@ -65,17 +87,17 @@ describe('OracleVector format validation', () => {
     ).toThrow(/upsertBatchSize/i);
   });
 
-  it('rejects bit indexes whose dimensions are not byte-aligned', async () => {
+  it('rejects bit indexes beyond the Oracle binary dimension limit', async () => {
     const vector = createVector();
 
     await expect(
       vector.createIndex({
         indexName: 'bit_dimension_mismatch',
-        dimension: 7,
+        dimension: 65529,
         vectorFormat: 'bit',
         buildIndex: false,
       }),
-    ).rejects.toThrow(/multiple of 8/i);
+    ).rejects.toThrow(/65528/i);
   });
 
   it('rejects non-bit metrics for bit indexes', async () => {
@@ -119,18 +141,8 @@ describe('OracleVector format validation', () => {
     ).rejects.toThrow(/vector.*bit.*int8/i);
   });
 
-  it('rejects jaccard metric for HNSW/IVF index types before running any DDL', async () => {
+  it('rejects jaccard metric for IVF before running any DDL', async () => {
     const vector = createVector();
-
-    await expect(
-      vector.createIndex({
-        indexName: 'jaccard_hnsw_mismatch',
-        dimension: 8,
-        vectorFormat: 'bit',
-        metric: 'jaccard',
-        indexConfig: { type: 'hnsw' },
-      }),
-    ).rejects.toThrow(/jaccard.*exact search/i);
 
     await expect(
       vector.createIndex({
@@ -429,7 +441,12 @@ describe('OracleVector hot path SQL shape', () => {
 
     expect(executeMany).toHaveBeenCalledOnce();
     expect(String(executeMany.mock.calls[0]?.[0])).toContain('WHERE vector_id = :id');
-    expect(executeMany.mock.calls[0]?.[1]).toEqual([{ id: 'a' }, { id: 'b' }, { id: 'c' }]);
+    expect(String(executeMany.mock.calls[0]?.[0])).toContain('AND namespace = :namespace');
+    expect(executeMany.mock.calls[0]?.[1]).toEqual([
+      { id: 'a', namespace: 'default' },
+      { id: 'b', namespace: 'default' },
+      { id: 'c', namespace: 'default' },
+    ]);
     expect(commit).toHaveBeenCalledOnce();
     expect(close).toHaveBeenCalledOnce();
   });

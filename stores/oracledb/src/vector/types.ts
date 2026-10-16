@@ -1,12 +1,22 @@
-import type { CreateIndexParams, QueryVectorParams, VectorFilter } from '@mastra/core/vector';
+import type {
+  CreateIndexParams,
+  DeleteVectorParams,
+  DeleteVectorsParams,
+  QueryVectorParams,
+  SparseVector,
+  UpdateVectorParams,
+  UpsertVectorParams,
+  VectorFilter,
+} from '@mastra/core/vector';
 
 import type { OracleConnectionConfig, OraclePoolManager } from '../shared/connection';
 
 // Public vector configuration types are kept Oracle-specific while matching Mastra's provider contracts.
 export type OracleMetric = 'cosine' | 'euclidean' | 'dotproduct' | 'hamming' | 'jaccard';
 export type OracleVectorIndexType = 'hnsw' | 'ivf' | 'none';
-export type OracleVectorFormat = 'vector' | 'bit' | 'int8';
+export type OracleVectorFormat = 'vector' | 'halfvec' | 'sparsevec' | 'bit' | 'int8';
 export type OracleQueryMode = 'approx' | 'exact';
+export type OracleScoreMode = 'native' | 'postgres';
 export type OracleVectorMemoryScope = 'MEMORY' | 'SPFILE' | 'BOTH';
 
 export type OracleVectorFilter = VectorFilter;
@@ -33,6 +43,8 @@ export interface OracleVectorMemoryConfig {
 // Pool injection lets OracleStore and OracleVector share lifecycle in production deployments.
 export interface OracleVectorConfig extends OracleConnectionConfig {
   id: string;
+  /** Skip automatic table, registry, and schema initialization. */
+  disableInit?: boolean;
   poolManager?: OraclePoolManager;
   schemaName?: string;
   tablePrefix?: string;
@@ -40,6 +52,8 @@ export interface OracleVectorConfig extends OracleConnectionConfig {
   defaultIndexConfig?: OracleVectorIndexConfig;
   defaultMetadataIndexes?: string[];
   defaultVectorFormat?: OracleVectorFormat;
+  /** Retain native Oracle scores by default; select PostgreSQL normalization explicitly. */
+  defaultScoreMode?: OracleScoreMode;
   /**
    * Number of vectors to send per Oracle executeMany call. A single upsert
    * operation still commits once after all batches succeed.
@@ -65,9 +79,31 @@ export interface OracleCreateIndexParams extends Omit<CreateIndexParams, 'metric
 
 // Query mode maps to Oracle's exact/approx fetch behavior while preserving Mastra query options.
 export interface OracleQueryVectorParams extends QueryVectorParams<OracleVectorFilter> {
+  namespace?: string;
   minScore?: number;
+  scoreMode?: OracleScoreMode;
   queryMode?: OracleQueryMode;
   targetAccuracy?: number;
+  ef?: number;
+  probes?: number;
+}
+
+export type OracleUpsertVectorParams = (
+  | UpsertVectorParams<OracleVectorFilter>
+  | (Omit<UpsertVectorParams<OracleVectorFilter>, 'vectors' | 'sparseVectors'> & {
+      vectors?: never;
+      sparseVectors: SparseVector[];
+    })
+) & { namespace?: string };
+
+export type OracleUpdateVectorParams = UpdateVectorParams<OracleVectorFilter> & { namespace?: string };
+
+export interface OracleDeleteVectorParams extends DeleteVectorParams {
+  namespace?: string;
+}
+
+export interface OracleDeleteVectorsParams extends DeleteVectorsParams<OracleVectorFilter> {
+  namespace?: string;
 }
 
 // Oracle returns storage details that Mastra's generic IndexStats does not currently model.
@@ -80,6 +116,8 @@ export interface OracleIndexStats {
   indexType: OracleVectorIndexType;
   vectorFormat: OracleVectorFormat;
   accuracy?: number;
+  /** Requested build parameters; indexType reports the currently built physical index. */
+  indexConfig?: OracleVectorIndexConfig;
 }
 
 export interface OracleRebuildIndexParams extends OracleBuildIndexParams {}

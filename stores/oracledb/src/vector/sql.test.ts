@@ -36,17 +36,18 @@ describe('Oracle vector SQL helpers', () => {
     expect(() => validateMetricForFormat('hamming', 'vector')).toThrow(/requires vectorFormat "bit"/i);
     expect(validateDimension(3)).toBe(3);
     expect(() => validateDimension(0)).toThrow(/positive integer/i);
-    expect(() => validateVectorFormatDimension('bit', 7)).toThrow(/multiple of 8/i);
+    expect(validateVectorFormatDimension('bit', 7)).toBeUndefined();
+    expect(() => validateVectorFormatDimension('bit', 65529)).toThrow(/65528/i);
     expect(validateAccuracy(100)).toBe(100);
     expect(() => validateAccuracy(101)).toThrow(/between 1 and 100/i);
   });
 
-  it('rejects jaccard for HNSW/IVF indexes but allows it for exact search', () => {
-    expect(() => validateMetricForFormat('jaccard', 'bit', 'hnsw')).toThrow(/jaccard.*exact search/i);
+  it('allows jaccard for HNSW and exact search while rejecting IVF', () => {
+    expect(validateMetricForFormat('jaccard', 'bit', 'hnsw')).toBeUndefined();
     expect(() => validateMetricForFormat('jaccard', 'bit', 'ivf')).toThrow(/jaccard.*exact search/i);
     expect(validateMetricForFormat('jaccard', 'bit', 'none')).toBeUndefined();
     expect(validateMetricForFormat('jaccard', 'bit')).toBeUndefined();
-    // hamming stays valid for HNSW/IVF bit indexes; only jaccard is exact-search-only.
+    // Hamming remains available for both physical index types.
     expect(validateMetricForFormat('hamming', 'bit', 'hnsw')).toBeUndefined();
   });
 

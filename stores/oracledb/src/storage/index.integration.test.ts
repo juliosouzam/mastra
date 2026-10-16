@@ -7,6 +7,30 @@ const runIntegration = process.env.RUN_ORACLE_STORAGE_INTEGRATION === 'true';
 const describeIntegration = runIntegration ? describe : describe.skip;
 
 describeIntegration('OracleStore configurable schema integration', () => {
+  it('connects to the Oracle release selected for integration testing', async () => {
+    const store = new OracleStore({
+      id: 'oracle-version-integration',
+      user: process.env.ORACLE_DATABASE_USER,
+      password: process.env.ORACLE_DATABASE_PASSWORD,
+      connectString: process.env.ORACLE_DATABASE_CONNECT_STRING,
+    });
+    try {
+      const pool = await store.getPool();
+      const connection = await pool.getConnection();
+      try {
+        expect(connection.oracleServerVersionString).toBeTruthy();
+        const expectedVersion = process.env.ORACLE_DATABASE_VERSION_PREFIX;
+        if (expectedVersion) {
+          expect(connection.oracleServerVersionString.slice(0, expectedVersion.length)).toBe(expectedVersion);
+        }
+      } finally {
+        await connection.close();
+      }
+    } finally {
+      await store.close();
+    }
+  });
+
   it('creates custom memory and workflow indexes from OracleStore config', async () => {
     const suffix = Date.now();
     const threadIndexName = `IDX_ORACLE_THREADS_${suffix}`;

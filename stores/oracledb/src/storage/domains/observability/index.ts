@@ -58,6 +58,8 @@ import {
   logEventsTableSql,
   SPAN_NULLABLE_COLUMNS,
   SPAN_SCHEMA,
+  SPAN_JSON_COLUMNS,
+  LOG_JSON_COLUMNS,
 } from './schema';
 import * as scoresOps from './scores-bridge';
 import * as spansOps from './spans';
@@ -79,7 +81,25 @@ export class ObservabilityOracle extends ObservabilityStorage {
 
   constructor(config: OracleDomainConfig) {
     super();
-    this.db = new OracleDB(config);
+    this.db = new OracleDB({
+      ...config,
+      jsonColumns: [
+        ...SPAN_JSON_COLUMNS,
+        ...LOG_JSON_COLUMNS,
+        'scorer',
+        'preprocessStepResult',
+        'extractStepResult',
+        'analyzeStepResult',
+        'metadata',
+        'input',
+        'output',
+        'additionalContext',
+        'requestContext',
+        'entity',
+        'runtimeContext',
+        'scoringContext',
+      ],
+    });
     this.schemaName = config.schemaName;
     this.skipDefaultIndexes = config.skipDefaultIndexes;
     this.indexes = filterIndexesForTables(config.indexes, ObservabilityOracle.MANAGED_TABLES);
@@ -165,12 +185,12 @@ export class ObservabilityOracle extends ObservabilityStorage {
   }
 
   async listLogs(args: ListLogsArgs): Promise<ListLogsResponse> {
-    return logsOps.listLogs(this.db, this.schemaName, args);
+    return logsOps.listLogs(this.db.read, this.schemaName, args);
   }
 
   // Scores
   async listScores(args: ListScoresArgs): Promise<ListScoresResponse> {
-    return scoresOps.listScores(this.db, this.schemaName, args);
+    return scoresOps.listScores(this.db.read, this.schemaName, args);
   }
 
   async createScore(args: CreateScoreArgs): Promise<void> {
@@ -186,7 +206,7 @@ export class ObservabilityOracle extends ObservabilityStorage {
   }
 
   async getScoreById(scoreId: string): Promise<ScoreRecord | null> {
-    return scoresOps.getScoreById(this.db, this.schemaName, scoreId);
+    return scoresOps.getScoreById(this.db.read, this.schemaName, scoreId);
   }
 
   // Spans & traces
@@ -199,19 +219,19 @@ export class ObservabilityOracle extends ObservabilityStorage {
   }
 
   async getSpan(args: GetSpanArgs): Promise<GetSpanResponse | null> {
-    return spansOps.getSpan(this.db, this.schemaName, args);
+    return spansOps.getSpan(this.db.read, this.schemaName, args);
   }
 
   async getRootSpan(args: GetRootSpanArgs): Promise<GetRootSpanResponse | null> {
-    return spansOps.getRootSpan(this.db, this.schemaName, args);
+    return spansOps.getRootSpan(this.db.read, this.schemaName, args);
   }
 
   async getTrace(args: GetTraceArgs): Promise<GetTraceResponse | null> {
-    return spansOps.getTrace(this.db, this.schemaName, args);
+    return spansOps.getTrace(this.db.read, this.schemaName, args);
   }
 
   async getTraceLight(args: GetTraceArgs): Promise<GetTraceLightResponse | null> {
-    return spansOps.getTraceLight(this.db, this.schemaName, args);
+    return spansOps.getTraceLight(this.db.read, this.schemaName, args);
   }
 
   async updateSpan(args: UpdateSpanArgs): Promise<void> {
@@ -228,28 +248,28 @@ export class ObservabilityOracle extends ObservabilityStorage {
   }
 
   async listTraces(args: ListTracesArgs): Promise<ListTracesResponse> {
-    return spansOps.listTraces(this.db, this.schemaName, args);
+    return spansOps.listTraces(this.db.read, this.schemaName, args);
   }
 
   // Discovery (spans + log events)
   async getEntityTypes(args: GetEntityTypesArgs): Promise<GetEntityTypesResponse> {
-    return spansOps.getEntityTypes(this.db, this.schemaName, args);
+    return spansOps.getEntityTypes(this.db.read, this.schemaName, args);
   }
 
   async getEntityNames(args: GetEntityNamesArgs): Promise<GetEntityNamesResponse> {
-    return spansOps.getEntityNames(this.db, this.schemaName, args);
+    return spansOps.getEntityNames(this.db.read, this.schemaName, args);
   }
 
   async getServiceNames(args: GetServiceNamesArgs): Promise<GetServiceNamesResponse> {
-    return spansOps.getServiceNames(this.db, this.schemaName, args);
+    return spansOps.getServiceNames(this.db.read, this.schemaName, args);
   }
 
   async getEnvironments(args: GetEnvironmentsArgs): Promise<GetEnvironmentsResponse> {
-    return spansOps.getEnvironments(this.db, this.schemaName, args);
+    return spansOps.getEnvironments(this.db.read, this.schemaName, args);
   }
 
   async getTags(args: GetTagsArgs): Promise<GetTagsResponse> {
-    return spansOps.getTags(this.db, this.schemaName, args);
+    return spansOps.getTags(this.db.read, this.schemaName, args);
   }
 
   private async createIndexes(): Promise<void> {

@@ -42,6 +42,7 @@ export default defineConfig({
     include: ['src/**/*.test.ts', 'src/**/*.integration.test.ts'],
     // Integration files share one database; the observational memory lifecycle test alters a table the shared suite reads.
     fileParallelism: false,
+    hookTimeout: 120_000,
     coverage: {
       reporter: ['text', 'json', 'html'],
     },

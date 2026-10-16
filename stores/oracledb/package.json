@@ -29,8 +29,8 @@
     "posttest:integration": "docker compose down -v",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test:vector-integration": "RUN_ORACLE_VECTOR_INTEGRATION=true vitest run src/vector/index.integration.test.ts",
-    "test:storage-integration": "RUN_ORACLE_STORAGE_INTEGRATION=true vitest run --fileParallelism=false src/storage/index.test.ts src/storage/index.integration.test.ts src/storage/db/run-fencing.integration.test.ts"
+    "test:vector-integration": "RUN_ORACLE_VECTOR_INTEGRATION=true vitest run src/vector",
+    "test:storage-integration": "RUN_ORACLE_STORAGE_INTEGRATION=true vitest run --fileParallelism=false src/storage"
   },
   "license": "Apache-2.0",
   "dependencies": {
@@ -41,10 +41,12 @@
     "@internal/lint": "workspace:*",
     "@internal/types-builder": "workspace:*",
     "@mastra/core": "workspace:*",
+    "@mastra/auth-better-auth": "workspace:*",
     "@types/node": "22.19.15",
-    "@types/oracledb": "6.5.2",
+    "@types/oracledb": "6.10.4",
     "@vitest/coverage-v8": "catalog:",
     "@vitest/ui": "catalog:",
+    "better-auth": "^1.7.7",
     "eslint": "^10.4.1",
     "tsdown": "0.22.9",
     "tsx": "catalog:",
@@ -52,7 +54,13 @@
     "vitest": "catalog:"
   },
   "peerDependencies": {
-    "@mastra/core": ">=1.76.0-0 <2.0.0-0"
+    "@mastra/core": ">=1.76.0-0 <2.0.0-0",
+    "better-auth": "^1.7.7"
+  },
+  "peerDependenciesMeta": {
+    "better-auth": {
+      "optional": true
+    }
   },
   "files": [
     "dist"

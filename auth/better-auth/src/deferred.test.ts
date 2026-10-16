@@ -40,6 +40,17 @@ beforeEach(() => {
 });
 
 describe('deferred instance mode', () => {
+  it('lets custom database adapters own their schema instead of running Kysely migrations', async () => {
+    const provider = new MastraAuthBetterAuth({ secret: SECRET });
+    await provider.init({
+      database: { dialect: 'custom', ...memoryDb() },
+      publicUrl: 'http://localhost:3000',
+    });
+    const response = await provider.handleAuthRequest(new Request('http://localhost:3000/auth/api/get-session'));
+    expect(response.status).toBe(200);
+    expect(runMigrations).not.toHaveBeenCalled();
+  });
+
   it('requires auth or secret at construction', () => {
     expect(() => new MastraAuthBetterAuth({} as never)).toThrow(/Better Auth instance is required/);
   });

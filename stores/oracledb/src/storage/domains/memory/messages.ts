@@ -118,6 +118,7 @@ export async function listMessages(
     perPageInput,
     page,
     orderBy,
+    includeTotal: args.includeTotal,
   });
 }
 
@@ -144,6 +145,7 @@ export async function listMessagesByResourceId(
     perPageInput,
     page,
     orderBy,
+    includeTotal: args.includeTotal,
   });
 }
 
@@ -415,6 +417,7 @@ async function listMessagesWithWhere(
     perPageInput,
     page,
     orderBy,
+    includeTotal = true,
   }: {
     operation: string;
     baseFilter: { threadIds?: string[]; resourceId?: string };
@@ -423,6 +426,7 @@ async function listMessagesWithWhere(
     perPageInput?: number | false;
     page: number;
     orderBy?: StorageListMessagesInput['orderBy'];
+    includeTotal?: boolean;
   },
 ): Promise<StorageListMessagesOutput> {
   const metadataFilter = validateStorageMetadataFilter(filter?.metadata);
@@ -459,6 +463,7 @@ async function listMessagesWithWhere(
 
       let total: number;
       let messages: MastraDBMessage[];
+      let peekedHasMore: boolean | undefined;
       if (metadataFilter) {
         // Match the shared storage contract: metadata filtering happens before
         // pagination and uses strict scalar equality. Keeping the comparison in
@@ -475,6 +480,18 @@ async function listMessagesWithWhere(
         total = filteredMessages.length;
         messages =
           perPageInput === false ? filteredMessages : filteredMessages.slice(offset, offset + Math.max(0, perPage));
+      } else if (!includeTotal) {
+        // Peek one extra row to calculate hasMore without counting the whole history.
+        const pagination = paginationClause(perPageInput, perPage + 1, offset);
+        const result = await connection.execute<ObjectRow>(
+          `${messageSelect()} FROM ${table(ctx, TABLE_MESSAGES)} ${whereClause} ORDER BY ${messageOrderColumn(field)} ${direction}, id ${direction} ${pagination}`,
+          asBindParameters(binds),
+          executeOptions(),
+        );
+        messages = rows(result).map(row => parseMessage(row as MessageRow));
+        peekedHasMore = perPageInput !== false && messages.length > perPage;
+        if (peekedHasMore) messages = messages.slice(0, perPage);
+        total = offset + messages.length;
       } else {
         const countResult = await connection.execute<ObjectRow>(
           `SELECT COUNT(*) AS "count" FROM ${table(ctx, TABLE_MESSAGES)} ${whereClause}`,
@@ -517,9 +534,11 @@ async function listMessagesWithWhere(
           )
           .map(message => message.id),
       );
-      const hasMore = metadataFilter
-        ? perPageInput !== false && offset + primaryPageCount < total
-        : perPageInput !== false && returnedThreadMessageIds.size < total && offset + perPage < total;
+      const hasMore =
+        peekedHasMore ??
+        (metadataFilter
+          ? perPageInput !== false && offset + primaryPageCount < total
+          : perPageInput !== false && returnedThreadMessageIds.size < total && offset + perPage < total);
 
       return {
         messages: finalMessages,

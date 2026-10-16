@@ -29,6 +29,7 @@ type ThreadRow = {
   resourceId: string;
   title?: string | null;
   metadata?: unknown;
+  metadataJson?: unknown;
   createdAt: Date | string;
   updatedAt: Date | string;
 };
@@ -387,14 +388,14 @@ function parseThread(row: ThreadRow): StorageThreadType {
     id: String(row.id),
     resourceId: String(row.resourceId),
     title: parseOptionalString(row.title),
-    metadata: parseJson(row.metadata),
+    metadata: parseJson(row.metadataJson ?? row.metadata),
     createdAt: toDate(row.createdAt),
     updatedAt: toDate(row.updatedAt),
   };
 }
 
 function threadSelect(): string {
-  return `SELECT id AS "id", ${THREAD_RESOURCE_ID} AS "resourceId", title AS "title", metadata AS "metadata", ${THREAD_CREATED_AT} AS "createdAt", ${THREAD_UPDATED_AT} AS "updatedAt"`;
+  return `SELECT id AS "id", ${THREAD_RESOURCE_ID} AS "resourceId", title AS "title", JSON_SERIALIZE(metadata RETURNING CLOB) AS "metadataJson", ${THREAD_CREATED_AT} AS "createdAt", ${THREAD_UPDATED_AT} AS "updatedAt"`;
 }
 
 function threadOrderColumn(field: string): string {

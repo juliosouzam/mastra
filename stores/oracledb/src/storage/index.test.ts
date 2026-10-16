@@ -6,10 +6,19 @@ import {
   createDomainDirectTests,
 } from '../../../_test-utils/src';
 import { createAgentsTests } from '../../../_test-utils/src/domains/agents';
+import { createBackgroundTasksTests } from '../../../_test-utils/src/domains/background-tasks';
+import { createChannelsTests } from '../../../_test-utils/src/domains/channels';
+import { createDatasetsTests } from '../../../_test-utils/src/domains/datasets';
+import { createExperimentsTests } from '../../../_test-utils/src/domains/experiments';
+import { createFavoritesTests } from '../../../_test-utils/src/domains/favorites';
 import { createMemoryTest } from '../../../_test-utils/src/domains/memory';
 import { createObservabilityTests } from '../../../_test-utils/src/domains/observability';
 import { createRunFencingTests } from '../../../_test-utils/src/domains/run-fencing';
+import { createSchedulesTests } from '../../../_test-utils/src/domains/schedules';
 import { createScoresTest } from '../../../_test-utils/src/domains/scores';
+import { createSkillsTests } from '../../../_test-utils/src/domains/skills';
+import { createToolProviderConnectionsTests } from '../../../_test-utils/src/domains/tool-provider-connections';
+import { createWorkflowDefinitionsTests } from '../../../_test-utils/src/domains/workflow-definitions';
 import { createWorkflowsTests } from '../../../_test-utils/src/domains/workflows';
 import { OraclePoolManager } from '../shared/connection';
 import type { OracleMigration } from './migrations';
@@ -48,7 +57,15 @@ describeIntegration('OracleStore shared storage suite', () => {
 
   afterAll(async () => {
     await Promise.all(
-      ['workflows', 'memory', 'scores', 'observability', 'agents'].map(async domainName => {
+      [
+        'workflows',
+        'memory',
+        'scores',
+        'observability',
+        'agents',
+        'toolProviderConnections',
+        'workflowDefinitions',
+      ].map(async domainName => {
         const domain = await store.getStore(domainName as any);
         await domain?.dangerouslyClearAll?.();
       }),
@@ -56,12 +73,21 @@ describeIntegration('OracleStore shared storage suite', () => {
     await poolManager.close();
   });
 
-  createWorkflowsTests({ storage: store, workflowResultsNoopWhenRunMissing: false });
+  createWorkflowsTests({ storage: store });
   createMemoryTest({ storage: store });
-  createScoresTest({ storage: store, capabilities: { listScoresBySpan: true, toolMocks: false } });
+  createScoresTest({ storage: store, capabilities: { listScoresBySpan: true, scoreUpsert: true, toolMocks: true } });
   createObservabilityTests({ storage: store });
   createAgentsTests({ storage: store });
   createRunFencingTests({ storage: store });
+  createToolProviderConnectionsTests({ storage: store });
+  createWorkflowDefinitionsTests({ storage: store });
+  createSkillsTests({ storage: store });
+  createFavoritesTests({ storage: store });
+  createChannelsTests({ storage: store });
+  createBackgroundTasksTests({ storage: store });
+  createSchedulesTests({ storage: store });
+  createDatasetsTests({ storage: store });
+  createExperimentsTests({ storage: store });
 
   createClientAcceptanceTests({
     storeName: 'OracleStore',
@@ -255,9 +281,10 @@ describe('OracleStore facade', () => {
       vectorRegistryTableName: 'LOCAL_VECTOR_REGISTRY',
       indexes: [{ name: 'LOCAL_THREADS_RESOURCE_IDX', table: 'mastra_threads', columns: ['resourceId'] }],
     });
-    const domainInits = Object.values(store.stores).map(domain =>
-      vi.spyOn(domain as { init: () => Promise<void> }, 'init').mockResolvedValue(undefined),
-    );
+    const knowledgeInit = vi.spyOn(store.stores.knowledge!, 'init').mockResolvedValue(undefined);
+    const domainInits = Object.entries(store.stores)
+      .filter(([name]) => name !== 'knowledge')
+      .map(([, domain]) => vi.spyOn(domain as { init: () => Promise<void> }, 'init').mockResolvedValue(undefined));
     const migrationRegistry = {
       run: vi.fn(async (migrations: OracleMigration[], options: { forceRepeatable?: boolean }) => {
         for (const migration of migrations) {
@@ -294,6 +321,9 @@ describe('OracleStore facade', () => {
     for (const init of domainInits) {
       expect(init).toHaveBeenCalledTimes(2);
     }
+    expect(knowledgeInit).not.toHaveBeenCalled();
+    await store.initKnowledge();
+    expect(knowledgeInit).toHaveBeenCalledOnce();
     expect(migrationResults[0]).toMatchObject({ status: 'reapplied' });
     expect(migrations[0]).toMatchObject({ id: 'R001_MEMORY_SCHEMA' });
     await expect(store.getPool()).resolves.toBe(pool);
@@ -323,8 +353,8 @@ describe('OracleStore facade', () => {
   });
 });
 
-describe('OracleStore first-PR domains', () => {
-  it('exposes only the selected storage domains', () => {
+describe('OracleStore domain inventory', () => {
+  it('exposes the implemented storage domains', () => {
     const store = new OracleStore({
       id: 'first-pr-domain-test',
       pool: {} as any,
@@ -332,12 +362,28 @@ describe('OracleStore first-PR domains', () => {
 
     expect(Object.keys(store.stores).sort()).toEqual([
       'agents',
+      'backgroundTasks',
+      'blobs',
+      'channels',
+      'datasets',
+      'experiments',
+      'favorites',
+      'knowledge',
       'mcpClients',
+      'mcpServers',
       'memory',
+      'notifications',
       'observability',
+      'promptBlocks',
+      'schedules',
       'scorerDefinitions',
       'scores',
+      'skills',
+      'threadState',
+      'toolProviderConnections',
+      'workflowDefinitions',
       'workflows',
+      'workspaces',
     ]);
   });
 
@@ -361,6 +407,21 @@ describe('OracleStore first-PR domains', () => {
       'R005_SCORER_DEFINITIONS_SCHEMA',
       'R006_MCP_CLIENTS_SCHEMA',
       'R007_AGENTS_SCHEMA',
+      'R008_THREAD_STATE_SCHEMA',
+      'R009_BLOBS_SCHEMA',
+      'R010_TOOL_PROVIDER_CONNECTIONS_SCHEMA',
+      'R011_WORKFLOW_DEFINITIONS_SCHEMA',
+      'R012_PROMPT_BLOCKS_SCHEMA',
+      'R013_MCP_SERVERS_SCHEMA',
+      'R014_WORKSPACES_SCHEMA',
+      'R015_SKILLS_SCHEMA',
+      'R016_FAVORITES_SCHEMA',
+      'R017_CHANNELS_SCHEMA',
+      'R018_BACKGROUND_TASKS_SCHEMA',
+      'R019_SCHEDULES_SCHEMA',
+      'R020_NOTIFICATIONS_SCHEMA',
+      'R021_DATASETS_SCHEMA',
+      'R022_EXPERIMENTS_SCHEMA',
     ]);
   });
 

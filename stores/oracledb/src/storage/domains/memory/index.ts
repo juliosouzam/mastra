@@ -49,8 +49,8 @@ import type {
 } from '@mastra/core/storage';
 
 import { isOracleErrorCode, normalizeBatchSize } from '../../../shared/connection';
-import { normalizeIdentifier } from '../../../vector/identifiers';
-import { filterIndexesForTables, OracleDB } from '../../db';
+import { indexNameForTable, normalizeIdentifier } from '../../../vector/identifiers';
+import { createOracleIndex, filterIndexesForTables, OracleDB } from '../../db';
 import type { OracleCreateIndexOptions } from '../../db';
 import { claimTransaction, DB_NOW_MS } from '../../db/run-fencing';
 import type { OracleDomainConfig } from '../../types';
@@ -64,6 +64,7 @@ import {
   updateMessages,
 } from './messages';
 import {
+  MEMORY_JSON_COLUMNS,
   clearObservationalMemory,
   createReflectionGeneration,
   getObservationalMemory,
@@ -84,7 +85,7 @@ import {
   updateBufferedObservations,
   updateBufferedReflection,
 } from './observational-buffering';
-import { getResourceById, saveResource, updateResource } from './resources';
+import { getResourceById, mergeResourceWorkingMemory, saveResource, updateResource } from './resources';
 import { backfillObservationalMemorySupersededBy, clearAllMemoryTables, initMemorySchema } from './schema';
 import {
   deleteThread,
@@ -95,7 +96,7 @@ import {
   updateThread,
   updateThreadResourceId,
 } from './threads';
-import { storageError, table } from './utils';
+import { pruneOrphanedSemanticRecallVectors, storageError, table } from './utils';
 import type { MemoryContext } from './utils';
 
 // Memory is the highest-traffic storage domain. It owns conversation threads,
@@ -108,6 +109,7 @@ const DEFAULT_VECTOR_REGISTRY_TABLE = 'MASTRA_VECTOR_INDEXES';
 
 export class MemoryOracle extends MemoryStorage {
   override readonly supportsPartialThreadUpdate = true;
+  override readonly supportsAtomicWorkingMemoryMerge = true;
   readonly supportsObservationalMemory = true;
   readonly supportsObservationalMemoryHistorySearch = true;
   // Memory owns all tables needed for normal message history plus observational
@@ -126,6 +128,9 @@ export class MemoryOracle extends MemoryStorage {
    * never pruned.
    */
   static override readonly retentionTables: RetentionTablesDescriptor = {
+    messages: { table: TABLE_MESSAGES, column: 'createdAt', indexed: true },
+    resources: { table: TABLE_RESOURCES, column: 'createdAt', indexed: true },
+    threads: { table: TABLE_THREADS, column: 'createdAt', indexed: true },
     runFences: { table: TABLE_MEMORY_RUN_FENCES, column: 'retiredAt', indexed: false, anchorType: 'epoch-ms' },
   };
 
@@ -138,7 +143,7 @@ export class MemoryOracle extends MemoryStorage {
 
   constructor(config: OracleDomainConfig) {
     super();
-    this.db = new OracleDB(config);
+    this.db = new OracleDB({ ...config, jsonColumns: MEMORY_JSON_COLUMNS });
     this.schemaName = config.schemaName;
     this.messageBatchSize = normalizeBatchSize(
       config.messageBatchSize,
@@ -167,11 +172,15 @@ export class MemoryOracle extends MemoryStorage {
       validateMetadataKeys: this.validateMetadataKeys.bind(this),
       parseOrderBy: this.parseOrderBy.bind(this),
       deepMergeConfig: this.deepMergeConfig.bind(this),
-      getThreadById: this.getThreadById.bind(this),
-      listMessagesById: this.listMessagesById.bind(this),
-      getResourceById: this.getResourceById.bind(this),
+      getThreadById: args => getThreadById(this.ctx, args),
+      listMessagesById: args => listMessagesById(this.ctx, args),
+      getResourceById: args => getResourceById(this.ctx, args),
       saveResource: this.saveResource.bind(this),
     };
+  }
+
+  private get readCtx(): MemoryContext {
+    return { ...this.ctx, db: this.db.read };
   }
 
   async init(): Promise<void> {
@@ -196,16 +205,42 @@ export class MemoryOracle extends MemoryStorage {
     const targets = resolveRetentionTargets({
       policies,
       descriptor: MemoryOracle.retentionTables,
-      order: ['runFences'],
+      order: ['messages', 'resources', 'threads', 'runFences'],
     });
-    return executeRetentionPrune({
+    // Retention is an explicit opt-in, including when default indexes are skipped.
+    for (const target of targets) {
+      if (!target.indexed || options?.signal?.aborted) continue;
+      try {
+        await this.db.withConnection(connection =>
+          createOracleIndex(
+            connection,
+            {
+              name: indexNameForTable(`${target.table}_RETENTION_IDX`, 'IDX'),
+              table: target.table,
+              columns: [target.column],
+            },
+            this.schemaName,
+          ),
+        );
+      } catch (error) {
+        this.logger?.warn?.(`Failed to create retention index for ${target.table}:`, error);
+      }
+    }
+    const results = await executeRetentionPrune({
       domain: 'memory',
       targets,
       options,
-      cutoffFor: (target, now) => retentionCutoffMs(target.policy, now),
+      cutoffFor: (target, now) =>
+        target.anchorType === 'epoch-ms'
+          ? retentionCutoffMs(target.policy, now)
+          : new Date(retentionCutoffMs(target.policy, now)),
       deleteBatch: (target, cutoff, limit) =>
         this.db.pruneBatch({ tableName: target.table as TABLE_NAMES, column: target.column, cutoff, limit }),
     });
+    if (policies.messages) {
+      await pruneOrphanedSemanticRecallVectors(this.ctx, policies.messages, options);
+    }
+    return results;
   }
 
   async dangerouslyClearAll(): Promise<void> {
@@ -271,7 +306,7 @@ export class MemoryOracle extends MemoryStorage {
   }
 
   async getThreadById(args: { threadId: string; resourceId?: string }): Promise<StorageThreadType | null> {
-    return getThreadById(this.ctx, args);
+    return getThreadById(this.readCtx, args);
   }
 
   async saveThread({ fence, ...args }: { thread: StorageThreadType; fence?: RunFence }): Promise<StorageThreadType> {
@@ -299,19 +334,19 @@ export class MemoryOracle extends MemoryStorage {
   }
 
   async listThreads(args: StorageListThreadsInput): Promise<StorageListThreadsOutput> {
-    return listThreads(this.ctx, args);
+    return listThreads(this.readCtx, args);
   }
 
   async listMessagesById(args: { messageIds: string[] }): Promise<{ messages: MastraDBMessage[] }> {
-    return listMessagesById(this.ctx, args);
+    return listMessagesById(this.readCtx, args);
   }
 
   async listMessages(args: StorageListMessagesInput): Promise<StorageListMessagesOutput> {
-    return listMessages(this.ctx, args);
+    return listMessages(this.readCtx, args);
   }
 
   async listMessagesByResourceId(args: StorageListMessagesByResourceIdInput): Promise<StorageListMessagesOutput> {
-    return listMessagesByResourceId(this.ctx, args);
+    return listMessagesByResourceId(this.readCtx, args);
   }
 
   async saveMessages({
@@ -342,11 +377,18 @@ export class MemoryOracle extends MemoryStorage {
   }
 
   async getResourceById(args: { resourceId: string }): Promise<StorageResourceType | null> {
-    return getResourceById(this.ctx, args);
+    return getResourceById(this.readCtx, args);
   }
 
   async saveResource(args: { resource: StorageResourceType }): Promise<StorageResourceType> {
     return saveResource(this.ctx, args);
+  }
+
+  override async mergeResourceWorkingMemory(args: {
+    resourceId: string;
+    merge: (existing: string | undefined) => string;
+  }): Promise<StorageResourceType> {
+    return mergeResourceWorkingMemory(this.ctx, args, resolveRunFence(this, undefined));
   }
 
   async updateResource({
@@ -362,7 +404,7 @@ export class MemoryOracle extends MemoryStorage {
   }
 
   async cloneThread(args: StorageCloneThreadInput): Promise<StorageCloneThreadOutput> {
-    const sourceThread = await this.getThreadById({ threadId: args.sourceThreadId });
+    const sourceThread = await getThreadById(this.ctx, { threadId: args.sourceThreadId });
     if (!sourceThread) {
       throw storageError(
         'CLONE_THREAD',
@@ -375,7 +417,7 @@ export class MemoryOracle extends MemoryStorage {
 
     const sourceMessages = await this.messagesForClone(args);
     const newThreadId = args.newThreadId ?? globalThis.crypto.randomUUID();
-    const existingDestination = await this.getThreadById({ threadId: newThreadId });
+    const existingDestination = await getThreadById(this.ctx, { threadId: newThreadId });
     if (existingDestination) {
       throw storageError(
         'CLONE_THREAD',
@@ -452,12 +494,12 @@ export class MemoryOracle extends MemoryStorage {
     const options = args.options;
     const messageIds = options?.messageFilter?.messageIds;
     if (messageIds?.length) {
-      return (await this.listMessagesById({ messageIds })).messages.filter(
+      return (await listMessagesById(this.ctx, { messageIds })).messages.filter(
         message => message.threadId === args.sourceThreadId,
       );
     }
 
-    const output = await this.listMessages({
+    const output = await listMessages(this.ctx, {
       threadId: args.sourceThreadId,
       perPage: false,
       filter: {
@@ -489,7 +531,7 @@ export class MemoryOracle extends MemoryStorage {
     limit = 10,
     options?: ObservationalMemoryHistoryOptions,
   ): Promise<ObservationalMemoryRecord[]> {
-    return getObservationalMemoryHistory(this.ctx, threadId, resourceId, limit, options);
+    return getObservationalMemoryHistory(this.readCtx, threadId, resourceId, limit, options);
   }
 
   async initializeObservationalMemory(input: CreateObservationalMemoryInput): Promise<ObservationalMemoryRecord> {

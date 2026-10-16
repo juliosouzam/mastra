@@ -22,10 +22,11 @@ import type {
 } from '@mastra/core/storage/domains/scorer-definitions';
 
 import { jsonBind, nullableClobBind, nullableJsonBind } from '../../../shared/connection';
-import { assertJsonPath, indexNameForTable, qualifyName } from '../../../vector/identifiers';
+import { indexNameForTable, qualifyName } from '../../../vector/identifiers';
 import { OracleDB, createOracleIndex, filterIndexesForTables } from '../../db';
 import type { OracleCreateIndexOptions, OracleTxClient } from '../../db';
 import {
+  buildOracleJsonContains,
   createOracleStorageError,
   parseOptionalJson,
   parseOptionalJsonObject,
@@ -50,6 +51,8 @@ const SNAPSHOT_FIELDS = [
 
 const SCORER_ACTIVE_VERSION_ID = '"activeVersionId"';
 const SCORER_AUTHOR_ID = '"authorId"';
+const SCORER_ORGANIZATION_ID = '"organizationId"';
+const SCORER_PROJECT_ID = '"projectId"';
 const SCORER_CREATED_AT = '"createdAt"';
 const SCORER_UPDATED_AT = '"updatedAt"';
 
@@ -67,7 +70,10 @@ type ScorerDefinitionRow = {
   status: StorageScorerDefinitionType['status'];
   activeVersionId?: string | null;
   authorId?: string | null;
+  organizationId?: string | null;
+  projectId?: string | null;
   metadata?: unknown;
+  metadataJson?: string | null;
   createdAt: Date | string;
   updatedAt: Date | string;
 };
@@ -102,7 +108,10 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
 
   constructor(config: OracleDomainConfig) {
     super();
-    this.db = new OracleDB(config);
+    this.db = new OracleDB({
+      ...config,
+      jsonColumns: ['model', 'scoreRange', 'presetConfig', 'defaultSampling', 'changedFields'],
+    });
     this.schemaName = config.schemaName;
     this.skipDefaultIndexes = config.skipDefaultIndexes;
     this.indexes = filterIndexesForTables(config.indexes, ScorerDefinitionsOracle.MANAGED_TABLES);
@@ -116,6 +125,11 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
     await this.db.createTable({
       tableName: TABLE_SCORER_DEFINITION_VERSIONS,
       schema: TABLE_SCHEMAS[TABLE_SCORER_DEFINITION_VERSIONS],
+    });
+    await this.db.alterTable({
+      tableName: TABLE_SCORER_DEFINITIONS,
+      schema: TABLE_SCHEMAS[TABLE_SCORER_DEFINITIONS],
+      ifNotExists: ['organizationId', 'projectId'],
     });
     await this.createIndexes();
   }
@@ -132,8 +146,12 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
   }
 
   async getById(id: string): Promise<StorageScorerDefinitionType | null> {
+    return this.getByIdWithClient(this.db.read, id);
+  }
+
+  private async getByIdWithClient(client: OracleDB, id: string): Promise<StorageScorerDefinitionType | null> {
     try {
-      const row = await this.db.oneOrNone<ScorerDefinitionRow>(
+      const row = await client.oneOrNone<ScorerDefinitionRow>(
         `${this.scorerSelect()} FROM ${this.table(TABLE_SCORER_DEFINITIONS)} WHERE id = :id`,
         { id },
       );
@@ -160,10 +178,11 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
 
         await client.none(
           `INSERT INTO ${this.table(TABLE_SCORER_DEFINITIONS)} (
-            id, status, ${SCORER_ACTIVE_VERSION_ID}, ${SCORER_AUTHOR_ID}, metadata,
+            id, status, ${SCORER_ACTIVE_VERSION_ID}, ${SCORER_AUTHOR_ID},
+            ${SCORER_ORGANIZATION_ID}, ${SCORER_PROJECT_ID}, metadata,
             ${SCORER_CREATED_AT}, ${SCORER_UPDATED_AT}
           ) VALUES (
-            :id, :status, :activeVersionId, :authorId, :metadata,
+            :id, :status, :activeVersionId, :authorId, :organizationId, :projectId, :metadata,
             :createdAt, :updatedAt
           )`,
           {
@@ -171,6 +190,8 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
             status: 'draft',
             activeVersionId: null,
             authorId: scorerDefinition.authorId ?? null,
+            organizationId: scorerDefinition.organizationId ?? null,
+            projectId: scorerDefinition.projectId ?? null,
             metadata: nullableJsonBind(scorerDefinition.metadata),
             createdAt: now,
             updatedAt: now,
@@ -178,7 +199,14 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
         );
 
         // Version rows keep scorer model, rubric, and sampling config reproducible across eval runs.
-        const { id: _id, authorId: _authorId, metadata: _metadata, ...snapshotConfig } = scorerDefinition;
+        const {
+          id: _id,
+          authorId: _authorId,
+          organizationId: _organizationId,
+          projectId: _projectId,
+          metadata: _metadata,
+          ...snapshotConfig
+        } = scorerDefinition;
         await this.insertVersion(client, {
           id: crypto.randomUUID(),
           scorerDefinitionId: scorerDefinition.id,
@@ -194,6 +222,8 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
         status: 'draft',
         activeVersionId: undefined,
         authorId: scorerDefinition.authorId,
+        organizationId: scorerDefinition.organizationId,
+        projectId: scorerDefinition.projectId,
         metadata: scorerDefinition.metadata,
         createdAt: now,
         updatedAt: now,
@@ -208,7 +238,7 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
     const { id, ...updates } = input;
 
     try {
-      const existingScorer = await this.getById(id);
+      const existingScorer = await this.getByIdWithClient(this.db, id);
       if (!existingScorer) {
         throw new Error(`Scorer definition with id ${id} not found`);
       }
@@ -253,7 +283,7 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
         binds,
       );
 
-      const updatedScorer = await this.getById(id);
+      const updatedScorer = await this.getByIdWithClient(this.db, id);
       if (!updatedScorer) {
         throw new Error(`Scorer definition with id ${id} not found after update`);
       }
@@ -279,7 +309,16 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
   }
 
   async list(args?: StorageListScorerDefinitionsInput): Promise<StorageListScorerDefinitionsOutput> {
-    const { page = 0, perPage: perPageInput, orderBy, authorId, metadata, status } = args || {};
+    const {
+      page = 0,
+      perPage: perPageInput,
+      orderBy,
+      authorId,
+      organizationId,
+      projectId,
+      metadata,
+      status,
+    } = args || {};
 
     try {
       this.validatePagination(page, perPageInput, 100);
@@ -292,9 +331,9 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
 
     try {
       const { field, direction } = this.parseOrderBy(orderBy);
-      const { whereClause, binds } = this.scorerWhereClause({ status, authorId, metadata });
+      const { whereClause, binds } = this.scorerWhereClause({ status, authorId, organizationId, projectId, metadata });
 
-      const countRow = await this.db.oneOrNone<{ count: number | string }>(
+      const countRow = await this.db.read.oneOrNone<{ count: number | string }>(
         `SELECT COUNT(*) AS "count" FROM ${this.table(TABLE_SCORER_DEFINITIONS)} ${whereClause}`,
         binds,
       );
@@ -323,7 +362,7 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
       const limit = perPageInput === false ? total : perPage;
       // `id ASC` breaks ties between rows sharing the same order-by value so
       // pages stay stable instead of duplicating or dropping rows across pages.
-      const rows = await this.db.manyOrNone<ScorerDefinitionRow>(
+      const rows = await this.db.read.manyOrNone<ScorerDefinitionRow>(
         `${this.scorerSelect()} FROM ${this.table(
           TABLE_SCORER_DEFINITIONS,
         )} ${whereClause} ORDER BY ${this.scorerOrderColumn(
@@ -396,7 +435,7 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
 
   async getVersion(id: string): Promise<ScorerDefinitionVersion | null> {
     try {
-      const row = await this.db.oneOrNone<ScorerDefinitionVersionRow>(
+      const row = await this.db.read.oneOrNone<ScorerDefinitionVersionRow>(
         `${this.versionSelect()} FROM ${this.table(TABLE_SCORER_DEFINITION_VERSIONS)} WHERE id = :id`,
         { id },
       );
@@ -408,7 +447,7 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
 
   async getVersionByNumber(scorerDefinitionId: string, versionNumber: number): Promise<ScorerDefinitionVersion | null> {
     try {
-      const row = await this.db.oneOrNone<ScorerDefinitionVersionRow>(
+      const row = await this.db.read.oneOrNone<ScorerDefinitionVersionRow>(
         `${this.versionSelect()} FROM ${this.table(
           TABLE_SCORER_DEFINITION_VERSIONS,
         )} WHERE ${VERSION_SCORER_DEFINITION_ID} = :scorerDefinitionId AND ${VERSION_VERSION_NUMBER} = :versionNumber`,
@@ -427,7 +466,7 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
 
   async getLatestVersion(scorerDefinitionId: string): Promise<ScorerDefinitionVersion | null> {
     try {
-      const row = await this.db.oneOrNone<ScorerDefinitionVersionRow>(
+      const row = await this.db.read.oneOrNone<ScorerDefinitionVersionRow>(
         `${this.versionSelect()} FROM ${this.table(
           TABLE_SCORER_DEFINITION_VERSIONS,
         )} WHERE ${VERSION_SCORER_DEFINITION_ID} = :scorerDefinitionId ORDER BY ${VERSION_VERSION_NUMBER} DESC FETCH FIRST 1 ROWS ONLY`,
@@ -459,7 +498,7 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
 
     try {
       const { field, direction } = this.parseVersionOrderBy(orderBy);
-      const countRow = await this.db.oneOrNone<{ count: number | string }>(
+      const countRow = await this.db.read.oneOrNone<{ count: number | string }>(
         `SELECT COUNT(*) AS "count" FROM ${this.table(
           TABLE_SCORER_DEFINITION_VERSIONS,
         )} WHERE ${VERSION_SCORER_DEFINITION_ID} = :scorerDefinitionId`,
@@ -490,7 +529,7 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
       const limit = perPageInput === false ? total : perPage;
       // `id ASC` breaks ties between versions sharing the same order-by value so
       // pages stay stable instead of duplicating or dropping rows across pages.
-      const rows = await this.db.manyOrNone<ScorerDefinitionVersionRow>(
+      const rows = await this.db.read.manyOrNone<ScorerDefinitionVersionRow>(
         `${this.versionSelect()} FROM ${this.table(
           TABLE_SCORER_DEFINITION_VERSIONS,
         )} WHERE ${VERSION_SCORER_DEFINITION_ID} = :scorerDefinitionId ORDER BY ${this.versionOrderColumn(
@@ -550,7 +589,7 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
 
   async countVersions(scorerDefinitionId: string): Promise<number> {
     try {
-      const row = await this.db.oneOrNone<{ count: number | string }>(
+      const row = await this.db.read.oneOrNone<{ count: number | string }>(
         `SELECT COUNT(*) AS "count" FROM ${this.table(
           TABLE_SCORER_DEFINITION_VERSIONS,
         )} WHERE ${VERSION_SCORER_DEFINITION_ID} = :scorerDefinitionId`,
@@ -564,13 +603,13 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
 
   private async createIndexes(): Promise<void> {
     await this.db.withConnection(async connection => {
-      if (!this.skipDefaultIndexes) {
-        for (const index of this.getDefaultIndexDefinitions()) {
-          try {
-            await createOracleIndex(connection, index, this.schemaName);
-          } catch (error) {
-            this.logger?.warn?.(`Failed to create Oracle default index ${index.name}:`, error);
-          }
+      for (const index of this.getDefaultIndexDefinitions()) {
+        if (this.skipDefaultIndexes && !index.unique) continue;
+        try {
+          await createOracleIndex(connection, index, this.schemaName);
+        } catch (error) {
+          if (index.unique) throw error;
+          this.logger?.warn?.(`Failed to create Oracle default index ${index.name}:`, error);
         }
       }
 
@@ -625,6 +664,8 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
   private scorerWhereClause(args: {
     status?: StorageScorerDefinitionType['status'];
     authorId?: string;
+    organizationId?: string;
+    projectId?: string;
     metadata?: Record<string, unknown>;
   }): { whereClause: string; binds: Record<string, unknown> } {
     const conditions: string[] = [];
@@ -640,15 +681,19 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
       binds.authorId = args.authorId;
     }
 
+    if (args.organizationId !== undefined) {
+      conditions.push(`${SCORER_ORGANIZATION_ID} = :organizationId`);
+      binds.organizationId = args.organizationId;
+    }
+    if (args.projectId !== undefined) {
+      conditions.push(`${SCORER_PROJECT_ID} = :projectId`);
+      binds.projectId = args.projectId;
+    }
+
     if (args.metadata && Object.keys(args.metadata).length > 0) {
-      let index = 0;
-      for (const [key, value] of Object.entries(args.metadata)) {
-        const bindName = `metadata${index++}`;
-        // Use JSON containment-style predicates so nested scorer metadata
-        // filters behave like PG JSONB containment where Oracle JSON allows it.
-        conditions.push(metadataJsonEquals('metadata', key, bindName));
-        binds[bindName] = jsonBind(value);
-      }
+      const metadata = buildOracleJsonContains('metadata', args.metadata);
+      conditions.push(metadata.sql);
+      Object.assign(binds, metadata.binds);
     }
 
     return { whereClause: conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '', binds };
@@ -660,7 +705,9 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
       `status AS "status"`,
       `${SCORER_ACTIVE_VERSION_ID} AS "activeVersionId"`,
       `${SCORER_AUTHOR_ID} AS "authorId"`,
-      `metadata AS "metadata"`,
+      `${SCORER_ORGANIZATION_ID} AS "organizationId"`,
+      `${SCORER_PROJECT_ID} AS "projectId"`,
+      `JSON_SERIALIZE(metadata RETURNING CLOB) AS "metadataJson"`,
       `${SCORER_CREATED_AT} AS "createdAt"`,
       `${SCORER_UPDATED_AT} AS "updatedAt"`,
     ].join(', ');
@@ -674,12 +721,12 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
       `name AS "name"`,
       `description AS "description"`,
       `type AS "type"`,
-      `model AS "model"`,
+      `JSON_SERIALIZE(model RETURNING CLOB) AS "model"`,
       `instructions AS "instructions"`,
-      `${VERSION_SCORE_RANGE} AS "scoreRange"`,
-      `${VERSION_PRESET_CONFIG} AS "presetConfig"`,
-      `${VERSION_DEFAULT_SAMPLING} AS "defaultSampling"`,
-      `${VERSION_CHANGED_FIELDS} AS "changedFields"`,
+      `JSON_SERIALIZE(${VERSION_SCORE_RANGE} RETURNING CLOB) AS "scoreRange"`,
+      `JSON_SERIALIZE(${VERSION_PRESET_CONFIG} RETURNING CLOB) AS "presetConfig"`,
+      `JSON_SERIALIZE(${VERSION_DEFAULT_SAMPLING} RETURNING CLOB) AS "defaultSampling"`,
+      `JSON_SERIALIZE(${VERSION_CHANGED_FIELDS} RETURNING CLOB) AS "changedFields"`,
       `${VERSION_CHANGE_MESSAGE} AS "changeMessage"`,
       `${VERSION_CREATED_AT} AS "createdAt"`,
     ].join(', ');
@@ -691,7 +738,9 @@ export class ScorerDefinitionsOracle extends ScorerDefinitionsStorage {
       status: row.status,
       activeVersionId: optionalString(row.activeVersionId),
       authorId: optionalString(row.authorId),
-      metadata: parseOptionalJsonObject(row.metadata),
+      organizationId: optionalString(row.organizationId),
+      projectId: optionalString(row.projectId),
+      metadata: parseOptionalJsonObject(row.metadataJson ?? row.metadata),
       createdAt: toDate(row.createdAt),
       updatedAt: toDate(row.updatedAt),
     };
@@ -773,9 +822,4 @@ export function getDefaultScorerDefinitionIndexDefinitions(
 function optionalString(value: unknown): string | undefined {
   if (value === null || value === undefined) return undefined;
   return String(value);
-}
-
-function metadataJsonEquals(column: string, path: string, bindName: string): string {
-  const jsonPath = assertJsonPath(path);
-  return `JSON_EXISTS(${column}, '${jsonPath}') AND JSON_EQUAL(JSON_QUERY(${column}, '${jsonPath}' RETURNING JSON NULL ON ERROR), :${bindName})`;
 }

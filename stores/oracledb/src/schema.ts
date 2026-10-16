@@ -1,31 +1,79 @@
 import {
+  RUN_FENCING_TABLE_SCHEMAS,
   TABLE_AGENTS,
+  TABLE_DATASETS,
+  TABLE_DATASET_ITEMS,
+  TABLE_DATASET_VERSIONS,
+  TABLE_EXPERIMENTS,
+  TABLE_EXPERIMENT_RESULTS,
+  TABLE_BACKGROUND_TASKS,
+  TABLE_NOTIFICATIONS,
+  TABLE_CHANNEL_INSTALLATIONS,
+  TABLE_CHANNEL_CONFIG,
+  TABLE_FAVORITES,
   TABLE_AGENT_VERSIONS,
   TABLE_MCP_CLIENTS,
   TABLE_MCP_CLIENT_VERSIONS,
+  TABLE_MCP_SERVERS,
+  TABLE_MCP_SERVER_VERSIONS,
   TABLE_MESSAGES,
+  TABLE_MEMORY_RUN_FENCES,
   TABLE_OBSERVATIONAL_MEMORY,
   TABLE_RESOURCES,
   TABLE_SCHEMAS,
   TABLE_SCORER_DEFINITION_VERSIONS,
   TABLE_SCORER_DEFINITIONS,
   TABLE_SCORERS,
+  TABLE_SCHEDULES,
+  TABLE_SCHEDULE_TRIGGERS,
+  TABLE_SKILL_BLOBS,
+  TABLE_SKILLS,
+  TABLE_SKILL_VERSIONS,
   TABLE_SPANS,
   TABLE_THREADS,
+  TABLE_THREAD_STATE,
+  TABLE_TOOL_PROVIDER_CONNECTIONS,
+  TABLE_PROMPT_BLOCKS,
+  TABLE_PROMPT_BLOCK_VERSIONS,
   TABLE_WORKFLOW_SNAPSHOT,
+  TABLE_WORKFLOW_RUN_OWNERS,
+  TABLE_WORKFLOW_DEFINITIONS,
+  TABLE_WORKSPACES,
+  TABLE_WORKSPACE_VERSIONS,
 } from '@mastra/core/storage';
+import type { TABLE_NAMES } from '@mastra/core/storage';
 
 import { generateOracleIndexSQL, generateOracleTableSQL } from './storage/db';
 import type { OracleCreateIndexOptions } from './storage/db';
 import { getDefaultAgentIndexDefinitions, ORACLE_AGENT_VERSIONS_SCHEMA } from './storage/domains/agents';
+import { getDefaultBackgroundTaskIndexDefinitions } from './storage/domains/background-tasks';
+import { getDefaultChannelIndexDefinitions } from './storage/domains/channels';
+import { getDefaultDatasetIndexDefinitions } from './storage/domains/datasets';
+import {
+  getDefaultExperimentIndexDefinitions,
+  ORACLE_EXPERIMENTS_SCHEMA,
+  ORACLE_EXPERIMENT_RESULTS_SCHEMA,
+} from './storage/domains/experiments';
+import { getDefaultFavoriteIndexDefinitions } from './storage/domains/favorites';
+import { KnowledgeOracle } from './storage/domains/knowledge';
 import { getDefaultMCPClientIndexDefinitions } from './storage/domains/mcp-clients';
+import { getDefaultMCPServerIndexDefinitions } from './storage/domains/mcp-servers';
+import { getDefaultNotificationIndexDefinitions } from './storage/domains/notifications';
 import {
   getDefaultObservabilityIndexDefinitions,
   logEventsTableSql,
   LOG_EVENTS_TABLE,
 } from './storage/domains/observability';
+import { ObservabilityStorageOracleVNext } from './storage/domains/observability/v-next';
+import { getDefaultPromptBlockIndexDefinitions } from './storage/domains/prompt-blocks';
+import { getDefaultScheduleIndexDefinitions } from './storage/domains/schedules';
 import { getDefaultScorerDefinitionIndexDefinitions } from './storage/domains/scorer-definitions';
 import { getDefaultScoreIndexDefinitions, ORACLE_SCORES_SCHEMA } from './storage/domains/scores';
+import { getDefaultSkillIndexDefinitions } from './storage/domains/skills';
+import { getDefaultThreadStateIndexDefinitions } from './storage/domains/thread-state';
+import { getDefaultToolProviderConnectionIndexDefinitions } from './storage/domains/tool-provider-connections';
+import { getDefaultWorkflowDefinitionIndexDefinitions } from './storage/domains/workflow-definitions';
+import { getDefaultWorkspaceIndexDefinitions } from './storage/domains/workspaces';
 import { DEFAULT_ORACLE_MIGRATIONS_TABLE, oracleMigrationTableSql } from './storage/migrations';
 import {
   assertJsonPath,
@@ -38,6 +86,7 @@ import {
 } from './vector/identifiers';
 import {
   buildVectorIndexParameterClause,
+  DEFAULT_NAMESPACE,
   defaultMetricForFormat,
   metricToken,
   normalizeMetric,
@@ -46,7 +95,7 @@ import {
   validateDimension,
   validateMetricForFormat,
   validateVectorFormatDimension,
-  vectorFormatToken,
+  vectorColumnType,
 } from './vector/sql';
 import type { OracleMetric, OracleVectorFormat, OracleVectorIndexConfig } from './vector/types';
 
@@ -57,10 +106,27 @@ export type OracleSchemaDomain =
   | 'memory'
   | 'workflows'
   | 'observability'
+  | 'observabilityVNext'
   | 'scores'
   | 'scorerDefinitions'
   | 'mcpClients'
   | 'agents'
+  | 'threadState'
+  | 'blobs'
+  | 'toolProviderConnections'
+  | 'workflowDefinitions'
+  | 'promptBlocks'
+  | 'mcpServers'
+  | 'workspaces'
+  | 'skills'
+  | 'favorites'
+  | 'channels'
+  | 'backgroundTasks'
+  | 'schedules'
+  | 'notifications'
+  | 'datasets'
+  | 'experiments'
+  | 'knowledge'
   | 'vector';
 
 export interface OracleVectorSchemaIndex {
@@ -96,6 +162,21 @@ const DEFAULT_DOMAINS: OracleSchemaDomain[] = [
   'scorerDefinitions',
   'mcpClients',
   'agents',
+  'threadState',
+  'blobs',
+  'toolProviderConnections',
+  'workflowDefinitions',
+  'promptBlocks',
+  'mcpServers',
+  'workspaces',
+  'skills',
+  'favorites',
+  'channels',
+  'backgroundTasks',
+  'schedules',
+  'notifications',
+  'datasets',
+  'experiments',
   'vector',
 ];
 const DEFAULT_VECTOR_TABLE_PREFIX = 'MASTRA_VEC';
@@ -131,6 +212,16 @@ export function exportSchemas(options: ExportOracleSchemasOptions = {}): string 
     statements.push(...customIndexStatements(options.indexes, ObservabilitySchemaTables, schemaName));
   }
 
+  if (domains.has('observabilityVNext')) {
+    statements.push(
+      ...ObservabilityStorageOracleVNext.getExportDDL({
+        schemaName,
+        skipDefaultIndexes: options.skipDefaultIndexes,
+        indexes: options.indexes,
+      }),
+    );
+  }
+
   if (domains.has('scores')) {
     statements.push(...scoreSchemaStatements(schemaName));
     if (!options.skipDefaultIndexes) statements.push(...scoreDefaultIndexStatements(schemaName));
@@ -139,20 +230,231 @@ export function exportSchemas(options: ExportOracleSchemasOptions = {}): string 
 
   if (domains.has('scorerDefinitions')) {
     statements.push(...scorerDefinitionSchemaStatements(schemaName));
-    if (!options.skipDefaultIndexes) statements.push(...scorerDefinitionDefaultIndexStatements(schemaName));
+    statements.push(...scorerDefinitionDefaultIndexStatements(schemaName, options.skipDefaultIndexes));
     statements.push(...customIndexStatements(options.indexes, ScorerDefinitionSchemaTables, schemaName));
   }
 
   if (domains.has('mcpClients')) {
     statements.push(...mcpClientSchemaStatements(schemaName));
-    if (!options.skipDefaultIndexes) statements.push(...mcpClientDefaultIndexStatements(schemaName));
+    statements.push(...mcpClientDefaultIndexStatements(schemaName, options.skipDefaultIndexes));
     statements.push(...customIndexStatements(options.indexes, MCPClientSchemaTables, schemaName));
   }
 
   if (domains.has('agents')) {
     statements.push(...agentSchemaStatements(schemaName));
-    if (!options.skipDefaultIndexes) statements.push(...agentDefaultIndexStatements(schemaName));
+    statements.push(...agentDefaultIndexStatements(schemaName, options.skipDefaultIndexes));
     statements.push(...customIndexStatements(options.indexes, AgentSchemaTables, schemaName));
+  }
+
+  if (domains.has('threadState')) {
+    statements.push(
+      generateOracleTableSQL({
+        tableName: TABLE_THREAD_STATE,
+        schema: TABLE_SCHEMAS[TABLE_THREAD_STATE],
+        schemaName,
+        compositePrimaryKey: ['threadId', 'type'],
+      }),
+    );
+    if (!options.skipDefaultIndexes) {
+      statements.push(
+        ...getDefaultThreadStateIndexDefinitions().map(index => generateOracleIndexSQL(index, schemaName)),
+      );
+    }
+    statements.push(...customIndexStatements(options.indexes, [TABLE_THREAD_STATE], schemaName));
+  }
+
+  if (domains.has('blobs')) {
+    statements.push(
+      generateOracleTableSQL({ tableName: TABLE_SKILL_BLOBS, schema: TABLE_SCHEMAS[TABLE_SKILL_BLOBS], schemaName }),
+    );
+    statements.push(...customIndexStatements(options.indexes, [TABLE_SKILL_BLOBS], schemaName));
+  }
+
+  if (domains.has('toolProviderConnections')) {
+    statements.push(
+      generateOracleTableSQL({
+        tableName: TABLE_TOOL_PROVIDER_CONNECTIONS,
+        schema: TABLE_SCHEMAS[TABLE_TOOL_PROVIDER_CONNECTIONS],
+        schemaName,
+        compositePrimaryKey: ['authorId', 'providerId', 'connectionId'],
+      }),
+    );
+    if (!options.skipDefaultIndexes)
+      statements.push(
+        ...getDefaultToolProviderConnectionIndexDefinitions().map(index => generateOracleIndexSQL(index, schemaName)),
+      );
+    statements.push(...customIndexStatements(options.indexes, [TABLE_TOOL_PROVIDER_CONNECTIONS], schemaName));
+  }
+
+  if (domains.has('workflowDefinitions')) {
+    statements.push(
+      generateOracleTableSQL({
+        tableName: TABLE_WORKFLOW_DEFINITIONS,
+        schema: TABLE_SCHEMAS[TABLE_WORKFLOW_DEFINITIONS],
+        schemaName,
+      }),
+    );
+    if (!options.skipDefaultIndexes)
+      statements.push(
+        ...getDefaultWorkflowDefinitionIndexDefinitions().map(index => generateOracleIndexSQL(index, schemaName)),
+      );
+    statements.push(...customIndexStatements(options.indexes, [TABLE_WORKFLOW_DEFINITIONS], schemaName));
+  }
+
+  if (domains.has('promptBlocks')) {
+    for (const tableName of [TABLE_PROMPT_BLOCKS, TABLE_PROMPT_BLOCK_VERSIONS] as const) {
+      statements.push(generateOracleTableSQL({ tableName, schema: TABLE_SCHEMAS[tableName], schemaName }));
+    }
+    for (const index of getDefaultPromptBlockIndexDefinitions(name => indexNameForTable(name, 'IDX'))) {
+      if (!options.skipDefaultIndexes || index.unique) statements.push(generateOracleIndexSQL(index, schemaName));
+    }
+    statements.push(
+      ...customIndexStatements(options.indexes, [TABLE_PROMPT_BLOCKS, TABLE_PROMPT_BLOCK_VERSIONS], schemaName),
+    );
+  }
+
+  if (domains.has('mcpServers')) {
+    for (const tableName of [TABLE_MCP_SERVERS, TABLE_MCP_SERVER_VERSIONS] as const) {
+      statements.push(generateOracleTableSQL({ tableName, schema: TABLE_SCHEMAS[tableName], schemaName }));
+    }
+    for (const index of getDefaultMCPServerIndexDefinitions(name => indexNameForTable(name, 'IDX'))) {
+      if (!options.skipDefaultIndexes || index.unique) statements.push(generateOracleIndexSQL(index, schemaName));
+    }
+    statements.push(
+      ...customIndexStatements(options.indexes, [TABLE_MCP_SERVERS, TABLE_MCP_SERVER_VERSIONS], schemaName),
+    );
+  }
+
+  if (domains.has('workspaces')) {
+    for (const tableName of [TABLE_WORKSPACES, TABLE_WORKSPACE_VERSIONS] as const) {
+      statements.push(generateOracleTableSQL({ tableName, schema: TABLE_SCHEMAS[tableName], schemaName }));
+    }
+    for (const index of getDefaultWorkspaceIndexDefinitions(name => indexNameForTable(name, 'IDX'))) {
+      if (!options.skipDefaultIndexes || index.unique) statements.push(generateOracleIndexSQL(index, schemaName));
+    }
+    statements.push(
+      ...customIndexStatements(options.indexes, [TABLE_WORKSPACES, TABLE_WORKSPACE_VERSIONS], schemaName),
+    );
+  }
+
+  if (domains.has('skills')) {
+    for (const tableName of [TABLE_SKILLS, TABLE_SKILL_VERSIONS] as const) {
+      statements.push(generateOracleTableSQL({ tableName, schema: TABLE_SCHEMAS[tableName], schemaName }));
+    }
+    for (const index of getDefaultSkillIndexDefinitions(name => indexNameForTable(name, 'IDX'))) {
+      if (!options.skipDefaultIndexes || index.unique) statements.push(generateOracleIndexSQL(index, schemaName));
+    }
+    statements.push(...customIndexStatements(options.indexes, [TABLE_SKILLS, TABLE_SKILL_VERSIONS], schemaName));
+  }
+
+  if (domains.has('favorites')) {
+    statements.push(
+      generateOracleTableSQL({
+        tableName: TABLE_FAVORITES,
+        schema: TABLE_SCHEMAS[TABLE_FAVORITES],
+        schemaName,
+        compositePrimaryKey: ['userId', 'entityType', 'entityId'],
+      }),
+    );
+    if (!options.skipDefaultIndexes)
+      statements.push(...getDefaultFavoriteIndexDefinitions().map(index => generateOracleIndexSQL(index, schemaName)));
+    statements.push(...customIndexStatements(options.indexes, [TABLE_FAVORITES], schemaName));
+  }
+
+  if (domains.has('channels')) {
+    for (const tableName of [TABLE_CHANNEL_INSTALLATIONS, TABLE_CHANNEL_CONFIG] as const)
+      statements.push(generateOracleTableSQL({ tableName, schema: TABLE_SCHEMAS[tableName], schemaName }));
+    for (const index of getDefaultChannelIndexDefinitions()) {
+      if (!options.skipDefaultIndexes || index.unique) statements.push(generateOracleIndexSQL(index, schemaName));
+    }
+    statements.push(
+      ...customIndexStatements(options.indexes, [TABLE_CHANNEL_INSTALLATIONS, TABLE_CHANNEL_CONFIG], schemaName),
+    );
+  }
+
+  if (domains.has('backgroundTasks')) {
+    statements.push(
+      generateOracleTableSQL({
+        tableName: TABLE_BACKGROUND_TASKS,
+        schema: TABLE_SCHEMAS[TABLE_BACKGROUND_TASKS],
+        schemaName,
+      }),
+    );
+    if (!options.skipDefaultIndexes)
+      statements.push(
+        ...getDefaultBackgroundTaskIndexDefinitions().map(index => generateOracleIndexSQL(index, schemaName)),
+      );
+    statements.push(...customIndexStatements(options.indexes, [TABLE_BACKGROUND_TASKS], schemaName));
+  }
+
+  if (domains.has('schedules')) {
+    for (const tableName of [TABLE_SCHEDULES, TABLE_SCHEDULE_TRIGGERS] as const)
+      statements.push(generateOracleTableSQL({ tableName, schema: TABLE_SCHEMAS[tableName], schemaName }));
+    if (!options.skipDefaultIndexes)
+      statements.push(...getDefaultScheduleIndexDefinitions().map(index => generateOracleIndexSQL(index, schemaName)));
+    statements.push(...customIndexStatements(options.indexes, [TABLE_SCHEDULES, TABLE_SCHEDULE_TRIGGERS], schemaName));
+  }
+
+  if (domains.has('notifications')) {
+    statements.push(
+      generateOracleTableSQL({
+        tableName: TABLE_NOTIFICATIONS,
+        schema: TABLE_SCHEMAS[TABLE_NOTIFICATIONS],
+        schemaName,
+        compositePrimaryKey: ['threadId', 'id'],
+      }),
+    );
+    if (!options.skipDefaultIndexes)
+      statements.push(
+        ...getDefaultNotificationIndexDefinitions().map(index => generateOracleIndexSQL(index, schemaName)),
+      );
+    statements.push(...customIndexStatements(options.indexes, [TABLE_NOTIFICATIONS], schemaName));
+  }
+
+  if (domains.has('datasets')) {
+    for (const tableName of [TABLE_DATASETS, TABLE_DATASET_ITEMS, TABLE_DATASET_VERSIONS] as const)
+      statements.push(
+        generateOracleTableSQL({
+          tableName,
+          schema: TABLE_SCHEMAS[tableName],
+          schemaName,
+          ...(tableName === TABLE_DATASET_ITEMS ? { compositePrimaryKey: ['id', 'datasetVersion'] } : {}),
+        }),
+      );
+    if (!options.skipDefaultIndexes)
+      statements.push(...getDefaultDatasetIndexDefinitions().map(index => generateOracleIndexSQL(index, schemaName)));
+    statements.push(
+      ...customIndexStatements(
+        options.indexes,
+        [TABLE_DATASETS, TABLE_DATASET_ITEMS, TABLE_DATASET_VERSIONS],
+        schemaName,
+      ),
+    );
+  }
+
+  if (domains.has('experiments')) {
+    for (const tableName of [TABLE_EXPERIMENTS, TABLE_EXPERIMENT_RESULTS] as const)
+      statements.push(
+        generateOracleTableSQL({
+          tableName,
+          schema: tableName === TABLE_EXPERIMENTS ? ORACLE_EXPERIMENTS_SCHEMA : ORACLE_EXPERIMENT_RESULTS_SCHEMA,
+          schemaName,
+        }),
+      );
+    statements.push(
+      ...getDefaultExperimentIndexDefinitions()
+        .filter(index => !options.skipDefaultIndexes || index.unique)
+        .map(index => generateOracleIndexSQL(index, schemaName)),
+    );
+    statements.push(
+      ...customIndexStatements(options.indexes, [TABLE_EXPERIMENTS, TABLE_EXPERIMENT_RESULTS], schemaName),
+    );
+  }
+
+  // Knowledge is opt-in at runtime and in offline deployments.
+  if (domains.has('knowledge')) {
+    statements.push(...KnowledgeOracle.getExportDDL(schemaName, options.skipDefaultIndexes));
+    statements.push(...customIndexStatements(options.indexes, KnowledgeOracle.MANAGED_TABLES, schemaName));
   }
 
   if (domains.has('vector')) {
@@ -162,8 +464,14 @@ export function exportSchemas(options: ExportOracleSchemasOptions = {}): string 
   return statements.map(statement => `${statement.trim()};`).join('\n\n');
 }
 
-const MemorySchemaTables = [TABLE_THREADS, TABLE_MESSAGES, TABLE_RESOURCES, TABLE_OBSERVATIONAL_MEMORY] as const;
-const WorkflowSchemaTables = [TABLE_WORKFLOW_SNAPSHOT] as const;
+const MemorySchemaTables = [
+  TABLE_THREADS,
+  TABLE_MESSAGES,
+  TABLE_RESOURCES,
+  TABLE_OBSERVATIONAL_MEMORY,
+  TABLE_MEMORY_RUN_FENCES,
+] as const;
+const WorkflowSchemaTables = [TABLE_WORKFLOW_SNAPSHOT, TABLE_WORKFLOW_RUN_OWNERS] as const;
 const ObservabilitySchemaTables = [TABLE_SPANS, LOG_EVENTS_TABLE] as const;
 const ScoreSchemaTables = [TABLE_SCORERS] as const;
 const ScorerDefinitionSchemaTables = [TABLE_SCORER_DEFINITIONS, TABLE_SCORER_DEFINITION_VERSIONS] as const;
@@ -179,7 +487,22 @@ function needsMigrationTable(domains: Set<OracleSchemaDomain>): boolean {
     domains.has('scores') ||
     domains.has('scorerDefinitions') ||
     domains.has('mcpClients') ||
-    domains.has('agents')
+    domains.has('agents') ||
+    domains.has('threadState') ||
+    domains.has('blobs') ||
+    domains.has('toolProviderConnections') ||
+    domains.has('workflowDefinitions') ||
+    domains.has('promptBlocks') ||
+    domains.has('mcpServers') ||
+    domains.has('workspaces') ||
+    domains.has('skills') ||
+    domains.has('favorites') ||
+    domains.has('channels') ||
+    domains.has('backgroundTasks') ||
+    domains.has('schedules') ||
+    domains.has('notifications') ||
+    domains.has('datasets') ||
+    domains.has('experiments')
   );
 }
 
@@ -249,8 +572,14 @@ function memorySchemaStatements(schemaName?: string): string[] {
   "lastBufferedAtTime" TIMESTAMP WITH TIME ZONE,
   metadata JSON,
   "createdAt" TIMESTAMP WITH TIME ZONE NOT NULL,
-  "updatedAt" TIMESTAMP WITH TIME ZONE NOT NULL
+  "updatedAt" TIMESTAMP WITH TIME ZONE NOT NULL,
+  "supersededBy" VARCHAR2(512)
 )`,
+    generateOracleTableSQL({
+      tableName: TABLE_MEMORY_RUN_FENCES as TABLE_NAMES,
+      schema: RUN_FENCING_TABLE_SCHEMAS[TABLE_MEMORY_RUN_FENCES],
+      schemaName,
+    }),
   ];
 }
 
@@ -265,6 +594,11 @@ function workflowSchemaStatements(schemaName?: string): string[] {
   "updatedAt" TIMESTAMP WITH TIME ZONE NOT NULL,
   CONSTRAINT ${storageConstraintName('MASTRA_WORKFLOW_SNAPSHOT_PK')} PRIMARY KEY (workflow_name, run_id)
 )`,
+    generateOracleTableSQL({
+      tableName: TABLE_WORKFLOW_RUN_OWNERS as TABLE_NAMES,
+      schema: RUN_FENCING_TABLE_SCHEMAS[TABLE_WORKFLOW_RUN_OWNERS],
+      schemaName,
+    }),
   ];
 }
 
@@ -356,6 +690,9 @@ function vectorSchemaStatements(config: ExportOracleSchemasOptions['vector'], sc
 
 function memoryDefaultIndexStatements(schemaName?: string): string[] {
   return [
+    { name: storageIndexName('MASTRA_THREADS_RETENTION_IDX'), table: TABLE_THREADS, columns: ['createdAt'] },
+    { name: storageIndexName('MASTRA_MESSAGES_RETENTION_IDX'), table: TABLE_MESSAGES, columns: ['createdAt'] },
+    { name: storageIndexName('MASTRA_RESOURCES_RETENTION_IDX'), table: TABLE_RESOURCES, columns: ['createdAt'] },
     {
       name: storageIndexName('MASTRA_THREADS_RESOURCE_CREATED_IDX'),
       table: TABLE_THREADS,
@@ -391,6 +728,7 @@ function memoryDefaultIndexStatements(schemaName?: string): string[] {
 
 function workflowDefaultIndexStatements(schemaName?: string): string[] {
   return [
+    { name: storageIndexName('MASTRA_WORKFLOW_RETENTION_IDX'), table: TABLE_WORKFLOW_SNAPSHOT, columns: ['updatedAt'] },
     {
       name: storageIndexName('MASTRA_WORKFLOW_NAME_CREATED_IDX'),
       table: TABLE_WORKFLOW_SNAPSHOT,
@@ -421,22 +759,22 @@ function observabilityDefaultIndexStatements(schemaName?: string): string[] {
   );
 }
 
-function agentDefaultIndexStatements(schemaName?: string): string[] {
-  return getDefaultAgentIndexDefinitions(indexName => storageIndexName(indexName)).map(index =>
-    generateOracleIndexSQL(index, schemaName),
-  );
+function agentDefaultIndexStatements(schemaName?: string, skipDefaultIndexes?: boolean): string[] {
+  return getDefaultAgentIndexDefinitions(indexName => storageIndexName(indexName))
+    .filter(index => !skipDefaultIndexes || index.unique)
+    .map(index => generateOracleIndexSQL(index, schemaName));
 }
 
-function scorerDefinitionDefaultIndexStatements(schemaName?: string): string[] {
-  return getDefaultScorerDefinitionIndexDefinitions(indexName => storageIndexName(indexName)).map(index =>
-    generateOracleIndexSQL(index, schemaName),
-  );
+function scorerDefinitionDefaultIndexStatements(schemaName?: string, skipDefaultIndexes?: boolean): string[] {
+  return getDefaultScorerDefinitionIndexDefinitions(indexName => storageIndexName(indexName))
+    .filter(index => !skipDefaultIndexes || index.unique)
+    .map(index => generateOracleIndexSQL(index, schemaName));
 }
 
-function mcpClientDefaultIndexStatements(schemaName?: string): string[] {
-  return getDefaultMCPClientIndexDefinitions(indexName => storageIndexName(indexName)).map(index =>
-    generateOracleIndexSQL(index, schemaName),
-  );
+function mcpClientDefaultIndexStatements(schemaName?: string, skipDefaultIndexes?: boolean): string[] {
+  return getDefaultMCPClientIndexDefinitions(indexName => storageIndexName(indexName))
+    .filter(index => !skipDefaultIndexes || index.unique)
+    .map(index => generateOracleIndexSQL(index, schemaName));
 }
 
 function customIndexStatements(
@@ -462,6 +800,7 @@ function vectorRegistryTableStatement(registryTableName: string, schemaName?: st
   index_type VARCHAR2(16) NOT NULL,
   vector_format VARCHAR2(16) DEFAULT 'vector' NOT NULL,
   accuracy NUMBER(3),
+  index_config JSON,
   created_at TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
   updated_at TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL
 )`;
@@ -483,16 +822,19 @@ function vectorIndexStatements(
   const metric = normalizeMetric(vectorIndex.metric ?? defaultMetricForFormat(vectorFormat));
   const tableName = tableNameForIndex(indexName, tablePrefix);
   const indexConfig: OracleVectorIndexConfig = { type: 'none', accuracy: 95, ...vectorIndex.indexConfig };
+  buildVectorIndexParameterClause(indexConfig);
   const registryIndexConfig: OracleVectorIndexConfig =
     vectorIndex.buildIndex === false ? { type: 'none', accuracy: 95 } : indexConfig;
   validateMetricForFormat(metric, vectorFormat, registryIndexConfig.type);
   const statements = [
     `CREATE TABLE ${qualifyName(tableName, schemaName)} (
-  vector_id VARCHAR2(512) PRIMARY KEY,
-  embedding VECTOR(${dimension}, ${vectorFormatToken(vectorFormat)}) NOT NULL,
+  vector_id VARCHAR2(512) NOT NULL,
+  namespace VARCHAR2(255 CHAR) DEFAULT '${DEFAULT_NAMESPACE}' NOT NULL,
+  embedding ${vectorColumnType(dimension, vectorFormat)} NOT NULL,
   metadata JSON NOT NULL,
   created_at TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
-  updated_at TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL
+  updated_at TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
+  PRIMARY KEY (namespace, vector_id)
 )`,
     vectorRegistryMergeStatement({
       registryTableName,
@@ -503,6 +845,7 @@ function vectorIndexStatements(
       indexType: registryIndexConfig.type ?? 'none',
       vectorFormat,
       accuracy: registryIndexConfig.accuracy ?? 95,
+      indexConfig,
       schemaName,
     }),
   ];
@@ -534,6 +877,7 @@ function vectorRegistryMergeStatement({
   indexType,
   vectorFormat,
   accuracy,
+  indexConfig,
   schemaName,
 }: {
   registryTableName: string;
@@ -544,6 +888,7 @@ function vectorRegistryMergeStatement({
   indexType: string;
   vectorFormat: OracleVectorFormat;
   accuracy: number;
+  indexConfig: OracleVectorIndexConfig;
   schemaName?: string;
 }): string {
   // MERGE makes generated SQL re-runnable during review, local setup, or DBA
@@ -557,7 +902,8 @@ USING (
     '${metric}' AS metric,
     '${indexType}' AS index_type,
     '${vectorFormat}' AS vector_format,
-    ${validateAccuracy(accuracy)} AS accuracy
+    ${validateAccuracy(accuracy)} AS accuracy,
+    JSON('${escapeSqlLiteral(JSON.stringify(indexConfig))}') AS index_config
   FROM dual
 ) source
 ON (target.index_name = source.index_name)
@@ -568,6 +914,7 @@ WHEN MATCHED THEN UPDATE SET
   target.index_type = source.index_type,
   target.vector_format = source.vector_format,
   target.accuracy = source.accuracy,
+  target.index_config = source.index_config,
   target.updated_at = SYSTIMESTAMP
 WHEN NOT MATCHED THEN INSERT (
   index_name,
@@ -577,6 +924,7 @@ WHEN NOT MATCHED THEN INSERT (
   index_type,
   vector_format,
   accuracy,
+  index_config,
   created_at,
   updated_at
 ) VALUES (
@@ -587,6 +935,7 @@ WHEN NOT MATCHED THEN INSERT (
   source.index_type,
   source.vector_format,
   source.accuracy,
+  source.index_config,
   SYSTIMESTAMP,
   SYSTIMESTAMP
 )`;

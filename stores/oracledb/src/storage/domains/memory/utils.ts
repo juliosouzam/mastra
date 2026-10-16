@@ -2,7 +2,7 @@ import type { MastraError } from '@mastra/core/error';
 import { ErrorCategory } from '@mastra/core/error';
 import type { IMastraLogger } from '@mastra/core/logger';
 import type { MastraDBMessage, StorageThreadType } from '@mastra/core/memory';
-import { TABLE_MEMORY_RUN_FENCES } from '@mastra/core/storage';
+import { runRetentionBatches, TABLE_MEMORY_RUN_FENCES, TABLE_MESSAGES } from '@mastra/core/storage';
 import type {
   BufferedObservationChunk,
   RunFence,
@@ -10,6 +10,8 @@ import type {
   ThreadOrderBy,
   ThreadSortDirection,
   StorageOrderBy,
+  PruneOptions,
+  TableRetentionPolicy,
 } from '@mastra/core/storage';
 
 import oracledb from 'oracledb';
@@ -280,5 +282,40 @@ export async function deleteSemanticRecallVectorsByMessageIds(
     } catch (error) {
       if (!isOracleErrorCode(error, [-942])) throw error;
     }
+  }
+}
+
+export async function pruneOrphanedSemanticRecallVectors(
+  ctx: Pick<MemoryContext, 'db' | 'schemaName' | 'vectorRegistryTableName' | 'logger'>,
+  policy: TableRetentionPolicy,
+  options?: PruneOptions,
+): Promise<void> {
+  try {
+    const vectorTables = await semanticRecallVectorTables(ctx, ctx.db);
+    for (const { tableName } of vectorTables) {
+      const vectorTable = qualifyName(tableName, ctx.schemaName);
+      await runRetentionBatches({
+        batchSize: policy.batchSize ?? 1000,
+        options,
+        deleteBatch: limit =>
+          ctx.db.tx(async (_client, connection) => {
+            const result = await connection.execute(
+              `DELETE FROM ${vectorTable} WHERE ROWID IN (
+                SELECT v.ROWID FROM ${vectorTable} v
+                WHERE JSON_VALUE(v.metadata, '$.message_id' RETURNING VARCHAR2(512) NULL ON ERROR) IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM ${table(ctx, TABLE_MESSAGES)} m
+                    WHERE m.id = JSON_VALUE(v.metadata, '$.message_id' RETURNING VARCHAR2(512) NULL ON ERROR)
+                  )
+                FETCH FIRST :limit ROWS ONLY
+              )`,
+              { limit },
+            );
+            return result.rowsAffected ?? 0;
+          }),
+      });
+    }
+  } catch (error) {
+    ctx.logger?.warn('Failed to sweep orphaned semantic-recall vectors after retention', { error });
   }
 }

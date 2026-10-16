@@ -3,13 +3,24 @@ import type { ListScoresResponse, SaveScorePayload, ScoreRowData, ScoringSource 
 import { saveScorePayloadSchema } from '@mastra/core/evals';
 import {
   calculatePagination,
+  executeRetentionPrune,
   normalizePerPage,
+  resolveRetentionTargets,
+  retentionCutoffMs,
   ScoresStorage,
   TABLE_SCHEMAS,
   TABLE_SCORERS,
   transformScoreRow as coreTransformScoreRow,
 } from '@mastra/core/storage';
-import type { ScoreTenancyFilters, StorageColumn, StoragePagination } from '@mastra/core/storage';
+import type {
+  PruneOptions,
+  PruneResult,
+  RetentionTablesDescriptor,
+  ScoreTenancyFilters,
+  StorageColumn,
+  StoragePagination,
+  TableRetentionPolicy,
+} from '@mastra/core/storage';
 
 import { indexNameForTable, qualifyName } from '../../../vector/identifiers';
 import { OracleDB, createOracleIndex, filterIndexesForTables } from '../../db';
@@ -95,6 +106,9 @@ function applyTenancyFilters(
 export class ScoresOracle extends ScoresStorage {
   // Scores are append-style eval records keyed for scorer, run, entity, trace, and span lookups.
   static readonly MANAGED_TABLES = [TABLE_SCORERS] as const;
+  static override readonly retentionTables: RetentionTablesDescriptor = {
+    scorers: { table: TABLE_SCORERS, column: 'createdAt', indexed: true },
+  };
 
   private readonly db: OracleDB;
   private readonly schemaName?: string;
@@ -103,10 +117,55 @@ export class ScoresOracle extends ScoresStorage {
 
   constructor(config: OracleDomainConfig) {
     super();
-    this.db = new OracleDB(config);
+    this.db = new OracleDB({
+      ...config,
+      jsonColumns: [
+        'scorer',
+        'preprocessStepResult',
+        'extractStepResult',
+        'analyzeStepResult',
+        'metadata',
+        'input',
+        'output',
+        'additionalContext',
+        'requestContext',
+        'entity',
+        'runtimeContext',
+        'scoringContext',
+      ],
+    });
     this.schemaName = config.schemaName;
     this.skipDefaultIndexes = config.skipDefaultIndexes;
     this.indexes = filterIndexesForTables(config.indexes, ScoresOracle.MANAGED_TABLES);
+  }
+
+  async prune(policies: Record<string, TableRetentionPolicy>, options?: PruneOptions): Promise<PruneResult[]> {
+    const targets = resolveRetentionTargets({ policies, descriptor: ScoresOracle.retentionTables, order: ['scorers'] });
+    if (policies.scorers && !options?.signal?.aborted) {
+      try {
+        await this.db.withConnection(connection =>
+          createOracleIndex(
+            connection,
+            {
+              name: this.indexName('MASTRA_SCORES_RETENTION_IDX'),
+              table: TABLE_SCORERS,
+              columns: ['createdAt'],
+            },
+            this.schemaName,
+          ),
+        );
+      } catch (error) {
+        this.logger?.warn?.(`Failed to create retention index for ${TABLE_SCORERS}:`, error);
+      }
+    }
+    return executeRetentionPrune({
+      domain: 'scores',
+      targets,
+      options,
+      cutoffFor: (target, now) => new Date(retentionCutoffMs(target.policy, now)),
+      deleteBatch: (target, cutoff, limit) =>
+        this.db.pruneBatch({ tableName: target.table, column: target.column, cutoff, limit }),
+    });
   }
 
   async init(): Promise<void> {
@@ -127,7 +186,7 @@ export class ScoresOracle extends ScoresStorage {
 
   async getScoreById({ id }: { id: string }): Promise<ScoreRowData | null> {
     try {
-      const row = await this.db.oneOrNone<ScoreRow>(`${this.selectScores()} FROM ${this.table()} WHERE id = :id`, {
+      const row = await this.db.read.oneOrNone<ScoreRow>(`${this.selectScores()} FROM ${this.table()} WHERE id = :id`, {
         id,
       });
       return row ? transformScoreRow(row) : null;
@@ -157,52 +216,58 @@ export class ScoresOracle extends ScoresStorage {
     }
 
     try {
-      const id = globalThis.crypto.randomUUID();
+      const id = validatedScore.id ?? globalThis.crypto.randomUUID();
       const now = new Date();
 
-      // Use the generic OracleDB insert path so JSON-heavy evaluator payloads
-      // and long prompt fields follow the shared JSON/CLOB bind handling.
-      await this.db.insert({
-        tableName: TABLE_SCORERS,
-        schema: ORACLE_SCORES_SCHEMA,
-        record: {
-          id,
-          scorerId: validatedScore.scorerId,
-          traceId: validatedScore.traceId,
-          spanId: validatedScore.spanId,
-          runId: validatedScore.runId,
-          scorer: validatedScore.scorer,
-          preprocessStepResult: validatedScore.preprocessStepResult,
-          extractStepResult: validatedScore.extractStepResult,
-          analyzeStepResult: validatedScore.analyzeStepResult,
-          score: validatedScore.score,
-          reason: validatedScore.reason,
-          metadata: validatedScore.metadata,
-          preprocessPrompt: validatedScore.preprocessPrompt,
-          extractPrompt: validatedScore.extractPrompt,
-          generateScorePrompt: validatedScore.generateScorePrompt,
-          generateReasonPrompt: validatedScore.generateReasonPrompt,
-          analyzePrompt: validatedScore.analyzePrompt,
-          reasonPrompt: validatedScore.reasonPrompt,
-          input: validatedScore.input,
-          output: validatedScore.output,
-          additionalContext: validatedScore.additionalContext,
-          requestContext: validatedScore.requestContext,
-          entityType: validatedScore.entityType,
-          entity: validatedScore.entity,
-          entityId: validatedScore.entityId,
-          source: validatedScore.source,
-          resourceId: validatedScore.resourceId,
-          threadId: validatedScore.threadId,
-          organizationId: validatedScore.organizationId,
-          projectId: validatedScore.projectId,
-          batchId: validatedScore.batchId,
-          datasetId: validatedScore.datasetId,
-          datasetItemId: validatedScore.datasetItemId,
-          createdAt: now,
-          updatedAt: now,
-        },
-      });
+      // Both write paths use the existing JSON/CLOB bind handling.
+      const record = {
+        id,
+        scorerId: validatedScore.scorerId,
+        traceId: validatedScore.traceId,
+        spanId: validatedScore.spanId,
+        runId: validatedScore.runId,
+        scorer: validatedScore.scorer,
+        preprocessStepResult: validatedScore.preprocessStepResult,
+        extractStepResult: validatedScore.extractStepResult,
+        analyzeStepResult: validatedScore.analyzeStepResult,
+        score: validatedScore.score,
+        reason: validatedScore.reason,
+        metadata: validatedScore.metadata,
+        preprocessPrompt: validatedScore.preprocessPrompt,
+        extractPrompt: validatedScore.extractPrompt,
+        generateScorePrompt: validatedScore.generateScorePrompt,
+        generateReasonPrompt: validatedScore.generateReasonPrompt,
+        analyzePrompt: validatedScore.analyzePrompt,
+        reasonPrompt: validatedScore.reasonPrompt,
+        input: validatedScore.input,
+        output: validatedScore.output,
+        additionalContext: validatedScore.additionalContext,
+        requestContext: validatedScore.requestContext,
+        entityType: validatedScore.entityType,
+        entity: validatedScore.entity,
+        entityId: validatedScore.entityId,
+        source: validatedScore.source,
+        resourceId: validatedScore.resourceId,
+        threadId: validatedScore.threadId,
+        organizationId: validatedScore.organizationId,
+        projectId: validatedScore.projectId,
+        batchId: validatedScore.batchId,
+        datasetId: validatedScore.datasetId,
+        datasetItemId: validatedScore.datasetItemId,
+        createdAt: now,
+        updatedAt: now,
+      };
+      if (validatedScore.id !== undefined) {
+        await this.db.merge({
+          tableName: TABLE_SCORERS,
+          schema: ORACLE_SCORES_SCHEMA,
+          keys: ['id'],
+          // A replacement clears omitted optional fields rather than retaining the old score's values.
+          record: Object.fromEntries(Object.entries(record).map(([key, value]) => [key, value ?? null])),
+        });
+      } else {
+        await this.db.insert({ tableName: TABLE_SCORERS, schema: ORACLE_SCORES_SCHEMA, record });
+      }
 
       return { score: { ...validatedScore, id, createdAt: now, updatedAt: now } };
     } catch (error) {
@@ -505,7 +570,7 @@ export class ScoresOracle extends ScoresStorage {
     try {
       // All score listing variants share the same pagination path so scorer,
       // run, entity, and trace views stay behaviorally identical.
-      const countRow = await this.db.oneOrNone<{ count: number | string }>(
+      const countRow = await this.db.read.oneOrNone<{ count: number | string }>(
         `SELECT COUNT(*) AS "count" FROM ${this.table()} ${whereClause}`,
         binds,
       );
@@ -528,7 +593,7 @@ export class ScoresOracle extends ScoresStorage {
 
       const limit = perPageInput === false ? total : perPage;
       const end = perPageInput === false ? total : offset + perPage;
-      const rows = await this.db.execute<ScoreRow>(
+      const rows = await this.db.read.execute<ScoreRow>(
         // `id ASC` breaks ties between rows with identical createdAt timestamps so
         // pages stay stable instead of duplicating or dropping rows across pages.
         `${this.selectScores()} FROM ${this.table()} ${whereClause} ORDER BY ${SCORE_CREATED_AT} DESC, id ASC OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY`,
@@ -584,25 +649,25 @@ export function scoreSelectColumns(): string {
     `${SCORE_TRACE_ID} AS "traceId"`,
     `${SCORE_SPAN_ID} AS "spanId"`,
     `${SCORE_RUN_ID} AS "runId"`,
-    `scorer AS "scorer"`,
-    `${SCORE_PREPROCESS_STEP_RESULT} AS "preprocessStepResult"`,
-    `${SCORE_EXTRACT_STEP_RESULT} AS "extractStepResult"`,
-    `${SCORE_ANALYZE_STEP_RESULT} AS "analyzeStepResult"`,
+    `JSON_SERIALIZE(scorer RETURNING CLOB) AS "scorer"`,
+    `JSON_SERIALIZE(${SCORE_PREPROCESS_STEP_RESULT} RETURNING CLOB) AS "preprocessStepResult"`,
+    `JSON_SERIALIZE(${SCORE_EXTRACT_STEP_RESULT} RETURNING CLOB) AS "extractStepResult"`,
+    `JSON_SERIALIZE(${SCORE_ANALYZE_STEP_RESULT} RETURNING CLOB) AS "analyzeStepResult"`,
     `score AS "score"`,
     `reason AS "reason"`,
-    `metadata AS "metadata"`,
+    `JSON_SERIALIZE(metadata RETURNING CLOB) AS "metadata"`,
     `${SCORE_PREPROCESS_PROMPT} AS "preprocessPrompt"`,
     `${SCORE_EXTRACT_PROMPT} AS "extractPrompt"`,
     `${SCORE_GENERATE_SCORE_PROMPT} AS "generateScorePrompt"`,
     `${SCORE_GENERATE_REASON_PROMPT} AS "generateReasonPrompt"`,
     `${SCORE_ANALYZE_PROMPT} AS "analyzePrompt"`,
     `${SCORE_REASON_PROMPT} AS "reasonPrompt"`,
-    `input AS "input"`,
-    `output AS "output"`,
-    `${SCORE_ADDITIONAL_CONTEXT} AS "additionalContext"`,
-    `${SCORE_REQUEST_CONTEXT} AS "requestContext"`,
+    `JSON_SERIALIZE(input RETURNING CLOB) AS "input"`,
+    `JSON_SERIALIZE(output RETURNING CLOB) AS "output"`,
+    `JSON_SERIALIZE(${SCORE_ADDITIONAL_CONTEXT} RETURNING CLOB) AS "additionalContext"`,
+    `JSON_SERIALIZE(${SCORE_REQUEST_CONTEXT} RETURNING CLOB) AS "requestContext"`,
     `${SCORE_ENTITY_TYPE} AS "entityType"`,
-    `entity AS "entity"`,
+    `JSON_SERIALIZE(entity RETURNING CLOB) AS "entity"`,
     `${SCORE_ENTITY_ID} AS "entityId"`,
     `source AS "source"`,
     `${SCORE_RESOURCE_ID} AS "resourceId"`,
@@ -619,6 +684,7 @@ export function scoreSelectColumns(): string {
 
 function defaultScoreIndexes(indexName: (name: string) => string): OracleCreateIndexOptions[] {
   return [
+    { name: indexName('MASTRA_SCORES_RETENTION_IDX'), table: TABLE_SCORERS, columns: ['createdAt'] },
     {
       name: indexName('MASTRA_SCORES_SCORER_ID'),
       table: TABLE_SCORERS,

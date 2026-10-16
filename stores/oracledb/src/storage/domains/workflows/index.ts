@@ -31,7 +31,7 @@ import type {
 } from '@mastra/core/storage';
 import type { StepResult, WorkflowRunState } from '@mastra/core/workflows';
 
-import { isOracleErrorCode, jsonBind } from '../../../shared/connection';
+import { jsonBind } from '../../../shared/connection';
 import { indexNameForTable, qualifyName } from '../../../vector/identifiers';
 import { OracleDB, createOracleIndex, filterIndexesForTables } from '../../db';
 import type { OracleCreateIndexOptions, OracleTxClient } from '../../db';
@@ -46,6 +46,15 @@ const STORE_NAME = 'ORACLEDB';
 const WORKFLOW_CREATED_AT = '"createdAt"';
 const WORKFLOW_UPDATED_AT = '"updatedAt"';
 const WORKFLOW_RESOURCE_ID = '"resourceId"';
+
+// Match the shared snapshot-memory extraction: suspended step first, then the durable loop input.
+const WORKFLOW_THREAD_ID = `COALESCE(
+  JSON_VALUE(
+    JSON_QUERY(snapshot, '$.context.*?(@.status == "suspended").suspendPayload.__streamState.messageList.memoryInfo.threadId' RETURNING CLOB WITH WRAPPER),
+    '$[0]' RETURNING VARCHAR2(512) NULL ON ERROR
+  ),
+  JSON_VALUE(snapshot, '$.context.input.messageListState.memoryInfo.threadId' RETURNING VARCHAR2(512) NULL ON ERROR)
+)`;
 
 type WorkflowRow = {
   workflowName: string;
@@ -87,6 +96,7 @@ export class WorkflowsOracle extends WorkflowsStorage {
    * older than its renew interval.
    */
   static override readonly retentionTables: RetentionTablesDescriptor = {
+    workflowSnapshot: { table: TABLE_WORKFLOW_SNAPSHOT, column: 'updatedAt', indexed: true },
     runOwnership: { table: TABLE_WORKFLOW_RUN_OWNERS, column: 'updatedAt', indexed: false, anchorType: 'epoch-ms' },
   };
 
@@ -97,7 +107,7 @@ export class WorkflowsOracle extends WorkflowsStorage {
 
   constructor(config: OracleDomainConfig) {
     super();
-    this.db = new OracleDB(config);
+    this.db = new OracleDB({ ...config, jsonColumns: ['snapshot'] });
     this.schemaName = config.schemaName;
     this.skipDefaultIndexes = config.skipDefaultIndexes;
     this.indexes = filterIndexesForTables(config.indexes, WorkflowsOracle.MANAGED_TABLES);
@@ -118,13 +128,33 @@ export class WorkflowsOracle extends WorkflowsStorage {
     const targets = resolveRetentionTargets({
       policies,
       descriptor: WorkflowsOracle.retentionTables,
-      order: ['runOwnership'],
+      order: ['workflowSnapshot', 'runOwnership'],
     });
+    if (policies.workflowSnapshot && !options?.signal?.aborted) {
+      try {
+        await this.db.withConnection(connection =>
+          createOracleIndex(
+            connection,
+            {
+              name: this.indexName('MASTRA_WORKFLOW_RETENTION_IDX'),
+              table: TABLE_WORKFLOW_SNAPSHOT,
+              columns: ['updatedAt'],
+            },
+            this.schemaName,
+          ),
+        );
+      } catch (error) {
+        this.logger?.warn?.(`Failed to create retention index for ${TABLE_WORKFLOW_SNAPSHOT}:`, error);
+      }
+    }
     return executeRetentionPrune({
       domain: 'workflows',
       targets,
       options,
-      cutoffFor: (target, now) => retentionCutoffMs(target.policy, now),
+      cutoffFor: (target, now) =>
+        target.anchorType === 'epoch-ms'
+          ? retentionCutoffMs(target.policy, now)
+          : new Date(retentionCutoffMs(target.policy, now)),
       deleteBatch: (target, cutoff, limit) =>
         this.db.pruneBatch({ tableName: target.table as TABLE_NAMES, column: target.column, cutoff, limit }),
     });
@@ -268,13 +298,13 @@ export class WorkflowsOracle extends WorkflowsStorage {
     try {
       return await this.db.tx(async client => {
         if (fence) await assertRunFence(client, this.runOwnersTable(), fence, 'updateWorkflowResults');
-        await this.ensureWorkflowRunRow(client, workflowName, runId);
-
         // Lock the row before patching the JSON snapshot so concurrent step updates do not overwrite each other.
-        const existing = await client.one<{ snapshot: unknown; resourceId?: string | null }>(
-          `SELECT snapshot AS "snapshot", ${WORKFLOW_RESOURCE_ID} AS "resourceId" FROM ${this.table()} WHERE workflow_name = :workflowName AND run_id = :runId FOR UPDATE`,
+        const existing = await client.oneOrNone<{ snapshot: unknown; resourceId?: string | null }>(
+          `SELECT JSON_SERIALIZE(snapshot RETURNING CLOB) AS "snapshot", ${WORKFLOW_RESOURCE_ID} AS "resourceId" FROM ${this.table()} WHERE workflow_name = :workflowName AND run_id = :runId FOR UPDATE`,
           { workflowName, runId },
         );
+        // A result arriving after deletion must not recreate the workflow run.
+        if (!existing) return {};
 
         const snapshot = parseSnapshot(existing.snapshot);
         snapshot.context[stepId] = result;
@@ -318,7 +348,7 @@ export class WorkflowsOracle extends WorkflowsStorage {
         // State updates patch top-level snapshot fields and require a pre-existing
         // run row; result updates create a default row when needed.
         const existing = await client.oneOrNone<{ snapshot: unknown }>(
-          `SELECT snapshot AS "snapshot" FROM ${this.table()} WHERE workflow_name = :workflowName AND run_id = :runId FOR UPDATE`,
+          `SELECT JSON_SERIALIZE(snapshot RETURNING CLOB) AS "snapshot" FROM ${this.table()} WHERE workflow_name = :workflowName AND run_id = :runId FOR UPDATE`,
           { workflowName, runId },
         );
         if (!existing) return undefined;
@@ -397,7 +427,7 @@ export class WorkflowsOracle extends WorkflowsStorage {
   }): Promise<WorkflowRunState | null> {
     try {
       const row = await this.db.oneOrNone<{ snapshot: unknown }>(
-        `SELECT snapshot AS "snapshot" FROM ${this.table()} WHERE workflow_name = :workflowName AND run_id = :runId`,
+        `SELECT JSON_SERIALIZE(snapshot RETURNING CLOB) AS "snapshot" FROM ${this.table()} WHERE workflow_name = :workflowName AND run_id = :runId`,
         { workflowName, runId },
       );
       return row ? parseSnapshot(row.snapshot) : null;
@@ -413,10 +443,19 @@ export class WorkflowsOracle extends WorkflowsStorage {
     perPage,
     page,
     resourceId,
+    threadId,
     status,
+    summary,
   }: StorageListWorkflowRunsInput = {}): Promise<WorkflowRuns> {
     try {
-      const { whereClause, binds } = this.workflowWhereClause({ workflowName, fromDate, toDate, resourceId, status });
+      const { whereClause, binds } = this.workflowWhereClause({
+        workflowName,
+        fromDate,
+        toDate,
+        resourceId,
+        threadId,
+        status,
+      });
       const usePagination = typeof perPage === 'number' && typeof page === 'number';
       const normalizedPerPage = usePagination ? normalizePerPage(perPage, Number.MAX_SAFE_INTEGER) : 0;
       const offset = usePagination ? page! * normalizedPerPage : 0;
@@ -424,7 +463,7 @@ export class WorkflowsOracle extends WorkflowsStorage {
       const count = usePagination
         ? Number(
             (
-              await this.db.one<{ count: number }>(
+              await this.db.read.one<{ count: number }>(
                 `SELECT COUNT(*) AS "count" FROM ${this.table()} ${whereClause}`,
                 binds,
               )
@@ -432,8 +471,8 @@ export class WorkflowsOracle extends WorkflowsStorage {
           )
         : 0;
 
-      const rows = await this.db.manyOrNone<WorkflowRow>(
-        `${this.workflowSelect()} FROM ${this.table()} ${whereClause} ORDER BY ${WORKFLOW_CREATED_AT} DESC ${
+      const rows = await this.db.read.manyOrNone<WorkflowRow>(
+        `${this.workflowSelect(summary)} FROM ${this.table()} ${whereClause} ORDER BY ${WORKFLOW_CREATED_AT} DESC ${
           usePagination ? 'OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY' : ''
         }`,
         usePagination ? { ...binds, offset, limit: normalizedPerPage } : binds,
@@ -461,6 +500,7 @@ export class WorkflowsOracle extends WorkflowsStorage {
         binds.workflowName = workflowName;
       }
 
+      // Run existence controls creation and recovery; a stale replica miss can reset persisted state.
       const rows = await this.db.manyOrNone<WorkflowRow>(
         `${this.workflowSelect()} FROM ${this.table()} WHERE ${conditions.join(' AND ')} ORDER BY ${WORKFLOW_CREATED_AT} DESC FETCH FIRST 1 ROWS ONLY`,
         binds,
@@ -542,6 +582,11 @@ export class WorkflowsOracle extends WorkflowsStorage {
   private defaultIndexes(): OracleCreateIndexOptions[] {
     return [
       {
+        name: this.indexName('MASTRA_WORKFLOW_RETENTION_IDX'),
+        table: TABLE_WORKFLOW_SNAPSHOT,
+        columns: ['updatedAt'],
+      },
+      {
         name: this.indexName('MASTRA_WORKFLOW_NAME_CREATED_IDX'),
         table: TABLE_WORKFLOW_SNAPSHOT,
         columns: ['workflow_name', 'createdAt'],
@@ -594,50 +639,20 @@ export class WorkflowsOracle extends WorkflowsStorage {
       )`;
   }
 
-  private async ensureWorkflowRunRow(client: OracleTxClient, workflowName: string, runId: string): Promise<void> {
-    const now = new Date();
-    try {
-      // Step-result updates may arrive before a full snapshot is persisted.
-      // Seed a minimal row so JSON patching always has a target.
-      await client.none(
-        `INSERT INTO ${this.table()} (
-          workflow_name,
-          run_id,
-          ${WORKFLOW_RESOURCE_ID},
-          snapshot,
-          ${WORKFLOW_CREATED_AT},
-          ${WORKFLOW_UPDATED_AT}
-        ) VALUES (
-          :workflowName,
-          :runId,
-          :resourceId,
-          :snapshot,
-          :createdAt,
-          :updatedAt
-        )`,
-        {
-          workflowName,
-          runId,
-          resourceId: null,
-          snapshot: jsonBind(createDefaultSnapshot(runId)),
-          createdAt: now,
-          updatedAt: now,
-        },
-      );
-    } catch (error) {
-      if (!isOracleErrorCode(error, [-1])) throw error;
-    }
-  }
-
   private workflowWhereClause(args: {
     workflowName?: string;
     fromDate?: Date;
     toDate?: Date;
     resourceId?: string;
+    threadId?: string;
     status?: string;
   }): { whereClause: string; binds: Record<string, unknown> } {
     const conditions: string[] = [];
     const binds: Record<string, unknown> = {};
+    if (args.threadId) {
+      conditions.push(`${WORKFLOW_THREAD_ID} = :threadId`);
+      binds.threadId = args.threadId;
+    }
     // Status lives inside the JSON snapshot; identifiers/resource/time remain
     // scalar columns for the common workflow list filters.
     if (args.workflowName) {
@@ -664,8 +679,15 @@ export class WorkflowsOracle extends WorkflowsStorage {
     return { whereClause: conditions.length ? `WHERE ${conditions.join(' AND ')}` : '', binds };
   }
 
-  private workflowSelect(): string {
-    return `SELECT workflow_name AS "workflowName", run_id AS "runId", ${WORKFLOW_RESOURCE_ID} AS "resourceId", snapshot AS "snapshot", ${WORKFLOW_CREATED_AT} AS "createdAt", ${WORKFLOW_UPDATED_AT} AS "updatedAt"`;
+  private workflowSelect(summary = false): string {
+    const snapshot = summary
+      ? `JSON_OBJECT(
+          'status' VALUE JSON_VALUE(snapshot, '$.status' RETURNING VARCHAR2(64) NULL ON ERROR),
+          'timestamp' VALUE JSON_VALUE(snapshot, '$.timestamp' RETURNING NUMBER NULL ON ERROR)
+          RETURNING JSON
+        )`
+      : 'snapshot';
+    return `SELECT workflow_name AS "workflowName", run_id AS "runId", ${WORKFLOW_RESOURCE_ID} AS "resourceId", JSON_SERIALIZE(${snapshot} RETURNING CLOB) AS "snapshot", ${WORKFLOW_CREATED_AT} AS "createdAt", ${WORKFLOW_UPDATED_AT} AS "updatedAt"`;
   }
 
   private parseWorkflowRun(row: WorkflowRow): WorkflowRun {
@@ -704,23 +726,6 @@ export class WorkflowsOracle extends WorkflowsStorage {
   ) {
     return createOracleStorageError({ storeName: STORE_NAME, operation, reason, details, cause, category });
   }
-}
-
-function createDefaultSnapshot(runId: string): WorkflowRunState {
-  return {
-    context: {},
-    activePaths: [],
-    timestamp: Date.now(),
-    suspendedPaths: {},
-    activeStepsPath: {},
-    resumeLabels: {},
-    serializedStepGraph: [],
-    status: 'pending',
-    value: {},
-    waitingPaths: {},
-    runId,
-    requestContext: {},
-  } as WorkflowRunState;
 }
 
 function parseSnapshot(value: unknown): WorkflowRunState {

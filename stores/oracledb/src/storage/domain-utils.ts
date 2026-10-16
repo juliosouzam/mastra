@@ -1,6 +1,7 @@
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import { createStorageErrorId } from '@mastra/core/storage';
 
+import { safeJsonValue } from '../shared/connection';
 import { parseOracleJson } from './db';
 
 export type OracleStorageErrorDetails = Record<string, string | number | boolean | undefined>;
@@ -69,4 +70,37 @@ export function parseOptionalStringArray(value: unknown): string[] | undefined {
 
 export function toDate(value: unknown): Date {
   return value instanceof Date ? value : new Date(String(value));
+}
+
+/** PostgreSQL-style JSON containment for storage metadata, including nested objects and array subsets. */
+export function buildOracleJsonContains(
+  column: string,
+  value: Record<string, unknown>,
+): {
+  sql: string;
+  binds: Record<string, unknown>;
+} {
+  if (!/^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)?$/.test(column)) throw new Error('Invalid JSON column name');
+  const binds: Record<string, unknown> = {};
+  const passing: string[] = [];
+  const predicate = (candidate: unknown): string => {
+    if (candidate === null) return '@.type() == "null"';
+    if (Array.isArray(candidate)) {
+      return ['@.type() == "array"', ...candidate.map(item => `exists(@[*]?(${predicate(item)}))`)].join(' && ');
+    }
+    if (typeof candidate === 'object') {
+      return [
+        '@.type() == "object"',
+        ...Object.entries(candidate).map(([key, item]) => `exists(@.${JSON.stringify(key)}?(${predicate(item)}))`),
+      ].join(' && ');
+    }
+    if (typeof candidate === 'boolean') return `@.type() == "boolean" && @ == ${candidate ? 'true' : 'false'}`;
+    if (candidate === '') return '@.type() == "string" && @ == ""';
+    const name = `metadataValue${passing.length}`;
+    binds[name] = candidate;
+    passing.push(`:${name} AS "${name}"`);
+    return `@.type() == "${typeof candidate}" && @ == $${name}`;
+  };
+  const path = `$?(${predicate(safeJsonValue(value))})`.replaceAll("'", "''");
+  return { sql: `JSON_EXISTS(${column}, '${path}'${passing.length ? ` PASSING ${passing.join(', ')}` : ''})`, binds };
 }

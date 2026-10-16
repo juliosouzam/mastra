@@ -1057,6 +1057,14 @@ describe('createMastraCode', () => {
       expect(createStorageMock).not.toHaveBeenCalled();
     });
 
+    it('accepts an injected OracleStore without creating a fallback database', async () => {
+      class OracleStore extends ForeignCompositeStore {}
+      const { createMastraCode } = await import('../index.js');
+      await createMastraCode({ storage: new OracleStore() as any });
+      expect(createStorageMock).not.toHaveBeenCalled();
+      expect(createVectorStoreMock).not.toHaveBeenCalled();
+    });
+
     it('accepts an unrecognized foreign store when storageBackend is configured', async () => {
       class SomeOtherStore extends ForeignCompositeStore {}
       const { createMastraCode } = await import('../index.js');

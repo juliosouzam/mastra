@@ -160,6 +160,7 @@ export class MastraAuthBetterAuth
   #secret: string | undefined;
   /** True when `init()` built the instance — then we also own its migrations. */
   #ownsInstance = false;
+  #customAdapterOwnsSchema = false;
   /** Once-per-process migration latch; reset on failure so a later call retries. */
   #migrated: Promise<void> | undefined;
   /**
@@ -317,6 +318,7 @@ export class MastraAuthBetterAuth
     };
     this.#auth = betterAuth(options);
     this.#ownsInstance = true;
+    this.#customAdapterOwnsSchema = authDb.dialect === 'custom' && typeof database === 'function';
   }
 
   /**
@@ -324,7 +326,9 @@ export class MastraAuthBetterAuth
    * this provider built — bring-your-own instances manage their own migrations.
    */
   async #ensureDbReady(): Promise<void> {
-    if (!this.#ownsInstance) return;
+    // Better Auth's getMigrations only supports its built-in Kysely adapter.
+    // Custom adapters (including Oracle) own their schema setup.
+    if (!this.#ownsInstance || this.#customAdapterOwnsSchema) return;
     this.#migrated ??= (async () => {
       const { runMigrations } = await getMigrations(this.auth.options as BetterAuthOptions);
       await runMigrations();

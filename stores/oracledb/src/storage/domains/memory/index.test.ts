@@ -1,9 +1,13 @@
 import type { MastraDBMessage, StorageThreadType } from '@mastra/core/memory';
 import type { Connection } from 'oracledb';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { OracleTxClient } from '../../db';
+import * as messageOps from './messages';
+import * as threadOps from './threads';
 import { MemoryOracle } from '.';
+
+afterEach(() => vi.restoreAllMocks());
 
 type SqlCall = {
   sql: string;
@@ -78,7 +82,7 @@ describe('MemoryOracle message consistency', () => {
       tx: vi.fn(),
     };
     (memory as any).db = db;
-    (memory as any).getThreadById = vi.fn(async ({ threadId }: { threadId: string }) =>
+    vi.spyOn(threadOps, 'getThreadById').mockImplementation(async (_ctx, { threadId }) =>
       threadId === 'thread-missing' ? null : createThread(threadId),
     );
 
@@ -167,18 +171,18 @@ describe('MemoryOracle cloneThread atomicity (CR-12)', () => {
   const sourceThread = createThread('thread-source');
   const sourceMessage = createMessage('msg-1', sourceThread.id);
 
-  function mockCloneLookups(memory: MemoryOracle): void {
+  function mockCloneLookups(): void {
     // Destination thread never exists yet; only the source thread id resolves.
-    (memory as any).getThreadById = vi.fn(async ({ threadId }: { threadId: string }) =>
+    vi.spyOn(threadOps, 'getThreadById').mockImplementation(async (_ctx, { threadId }) =>
       threadId === sourceThread.id ? sourceThread : null,
     );
-    (memory as any).listMessagesById = vi.fn(async () => ({ messages: [sourceMessage] }));
+    vi.spyOn(messageOps, 'listMessagesById').mockResolvedValue({ messages: [sourceMessage] });
   }
 
   it('rolls back the destination thread insert when the message insert fails, leaving no orphaned clone', async () => {
     const { connection, commit, rollback } = createFakeConnection({ failMessageInsert: true });
     const memory = createMemoryOracleWithConnection(connection);
-    mockCloneLookups(memory);
+    mockCloneLookups();
 
     await expect(
       memory.cloneThread({
@@ -199,7 +203,7 @@ describe('MemoryOracle cloneThread atomicity (CR-12)', () => {
   it('inserts the destination thread and cloned messages in a single transaction on success', async () => {
     const { connection, executeCalls, executeManyCalls, commit, rollback } = createFakeConnection();
     const memory = createMemoryOracleWithConnection(connection);
-    mockCloneLookups(memory);
+    mockCloneLookups();
 
     const result = await memory.cloneThread({
       sourceThreadId: sourceThread.id,
@@ -225,7 +229,7 @@ describe('MemoryOracle cloneThread atomicity (CR-12)', () => {
     // insert-only write hits ORA-00001 instead of updating the winner's row.
     const { connection, executeManyCalls, commit, rollback } = createFakeConnection({ failThreadInsertUnique: true });
     const memory = createMemoryOracleWithConnection(connection);
-    mockCloneLookups(memory);
+    mockCloneLookups();
 
     await expect(
       memory.cloneThread({
@@ -248,12 +252,12 @@ describe('MemoryOracle cloneThread atomicity (CR-12)', () => {
   it('skips the message insert entirely (and still commits) when the source thread has no messages', async () => {
     const { connection, executeCalls, executeManyCalls, commit } = createFakeConnection();
     const memory = createMemoryOracleWithConnection(connection);
-    (memory as any).getThreadById = vi.fn(async ({ threadId }: { threadId: string }) =>
+    vi.spyOn(threadOps, 'getThreadById').mockImplementation(async (_ctx, { threadId }) =>
       threadId === sourceThread.id ? sourceThread : null,
     );
     // messageIds is non-empty so messagesForClone takes the listMessagesById
     // path; the mock returning no rows simulates "already deleted"/no match.
-    (memory as any).listMessagesById = vi.fn(async () => ({ messages: [] }));
+    vi.spyOn(messageOps, 'listMessagesById').mockResolvedValue({ messages: [] });
 
     const result = await memory.cloneThread({
       sourceThreadId: sourceThread.id,

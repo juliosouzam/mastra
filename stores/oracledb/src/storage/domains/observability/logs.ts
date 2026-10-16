@@ -155,7 +155,7 @@ function logMergeSql(schemaName: string | undefined): string {
 }
 
 function logSelect(columns: readonly LogColumn[], tableAlias?: string): string {
-  return `SELECT ${columns.map(columnName => `${logQcol(tableAlias, columnName)} AS "${columnName}"`).join(', ')}`;
+  return `SELECT ${columns.map(columnName => `${LOG_JSON_COLUMNS.has(columnName) ? `JSON_SERIALIZE(${logQcol(tableAlias, columnName)} RETURNING CLOB)` : logQcol(tableAlias, columnName)} AS "${columnName}"`).join(', ')}`;
 }
 
 function transformLogRow(row: LogRow): LogRecord {

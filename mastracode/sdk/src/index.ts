@@ -337,8 +337,8 @@ export interface MastraCodeConfig {
    * LibSQL fallback — if the injected store fails, that's a hard error.
    */
   storage?: StorageConfig | MastraCompositeStore;
-  /** Backend for an injected custom storage instance. Inferred for LibSQLStore and PostgresStore. */
-  storageBackend?: 'libsql' | 'pg';
+  /** Backend for an injected custom storage instance. Inferred for LibSQLStore, PostgresStore, and OracleStore. */
+  storageBackend?: 'libsql' | 'pg' | 'oracle';
   /** Pre-built vector store instance for recall search. Skips the default vector store creation. */
   vector?: MastraVector;
   /** Host-owned Knowledge instance and the key used to register it on the mounted Mastra runtime. */
@@ -520,11 +520,12 @@ function hasAncestorClassNamed(value: object, className: string): boolean {
 
 function resolveInjectedStorageBackend(
   storage: MastraCompositeStore,
-  configuredBackend?: 'libsql' | 'pg',
-): 'libsql' | 'pg' {
+  configuredBackend?: 'libsql' | 'pg' | 'oracle',
+): 'libsql' | 'pg' | 'oracle' {
   if (configuredBackend) return configuredBackend;
   if (storage instanceof LibSQLStore || hasAncestorClassNamed(storage, 'LibSQLStore')) return 'libsql';
   if (storage instanceof PostgresStore || hasAncestorClassNamed(storage, 'PostgresStore')) return 'pg';
+  if (hasAncestorClassNamed(storage, 'OracleStore')) return 'oracle';
   throw new Error('storageBackend is required when injecting a custom storage instance.');
 }
 

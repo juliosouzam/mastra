@@ -1,14 +1,20 @@
 import {
+  TABLE_CHANNEL_INSTALLATIONS,
+  TABLE_NOTIFICATIONS,
+  TABLE_EXPERIMENTS,
+  TABLE_EXPERIMENT_RESULTS,
+  TABLE_SCHEDULE_TRIGGERS,
   TABLE_MESSAGES,
   TABLE_OBSERVATIONAL_MEMORY,
   TABLE_RESOURCES,
   TABLE_SCHEMAS,
   TABLE_THREADS,
+  TABLE_TOOL_PROVIDER_CONNECTIONS,
   TABLE_WORKFLOW_SNAPSHOT,
 } from '@mastra/core/storage';
 import type { CreateIndexOptions, StorageColumn, TABLE_NAMES } from '@mastra/core/storage';
 import type { Connection } from 'oracledb';
-import type oracledb from 'oracledb';
+import oracledb from 'oracledb';
 
 import {
   asBindParameters,
@@ -28,7 +34,10 @@ export type OracleExecuteManyBinds = Array<Record<string, unknown> | unknown[]>;
 
 export interface OracleDBConfig {
   poolManager: OraclePoolManager;
+  readPoolManager?: OraclePoolManager;
   schemaName?: string;
+  /** Domain JSON_SERIALIZE projection aliases to fetch as unbounded text. */
+  jsonColumns?: readonly string[];
 }
 
 export interface OracleTxClient {
@@ -50,16 +59,20 @@ type PreparedField = {
   columnName: string;
   columnSql: string;
   bindName: string;
+  valueSql: string;
   value: unknown;
 };
 
 // Thin adapter around one Oracle connection. It gives storage domains a small
 // API while keeping commit/rollback control in OracleDB.
 class OracleConnectionClient implements OracleTxClient {
-  constructor(private readonly connection: Connection) {}
+  constructor(
+    private readonly connection: Connection,
+    private readonly jsonColumns: readonly string[] = [],
+  ) {}
 
   async execute<T extends ObjectRow = ObjectRow>(sql: string, binds: OracleQueryBinds = {}): Promise<T[]> {
-    const result = await this.connection.execute<T>(sql, asBindParameters(binds), executeOptions());
+    const result = await this.connection.execute<T>(sql, asBindParameters(binds), executeOptions(this.jsonColumns));
     return rows(result);
   }
 
@@ -104,6 +117,14 @@ class OracleConnectionClient implements OracleTxClient {
 export class OracleDB {
   constructor(private readonly config: OracleDBConfig) {}
 
+  private reader?: OracleDB;
+  /** Explicit replica client. Schema work and mutations continue to use this writer. */
+  get read(): OracleDB {
+    const manager = this.config.readPoolManager;
+    if (!manager || manager === this.config.poolManager) return this;
+    return (this.reader ??= new OracleDB({ ...this.config, poolManager: manager, readPoolManager: undefined }));
+  }
+
   table(tableName: string): string {
     // Centralize schema qualification so domains never concatenate owner names by hand.
     return qualifyName(tableName, this.config.schemaName);
@@ -111,7 +132,7 @@ export class OracleDB {
 
   async execute<T extends ObjectRow = ObjectRow>(sql: string, binds: OracleQueryBinds = {}): Promise<T[]> {
     return this.config.poolManager.withConnection(async connection =>
-      new OracleConnectionClient(connection).execute<T>(sql, binds),
+      new OracleConnectionClient(connection, this.config.jsonColumns).execute<T>(sql, binds),
     );
   }
 
@@ -155,11 +176,15 @@ export class OracleDB {
     return this.config.poolManager.withConnection(async connection => {
       try {
         const table = this.table(tableName);
+        const columnSql = formatColumnName(column);
         const result = await connection.execute(
           `DELETE FROM ${table} WHERE ROWID IN (
-            SELECT ROWID FROM ${table} WHERE "${column}" < :cutoff ORDER BY "${column}" FETCH FIRST :limit ROWS ONLY
+            SELECT ROWID FROM ${table} WHERE ${columnSql} < :cutoff ORDER BY ${columnSql} FETCH FIRST :limit ROWS ONLY
           )`,
-          asBindParameters({ cutoff, limit }),
+          asBindParameters({
+            cutoff: cutoff instanceof Date ? { type: oracledb.DB_TYPE_TIMESTAMP_TZ, val: cutoff } : cutoff,
+            limit,
+          }),
         );
         await connection.commit();
         return result.rowsAffected ?? 0;
@@ -201,7 +226,7 @@ export class OracleDB {
     return this.config.poolManager.withConnection(async connection => {
       try {
         // Domains use this for multi-row mutations that must commit or roll back as one Oracle transaction.
-        const result = await callback(new OracleConnectionClient(connection), connection);
+        const result = await callback(new OracleConnectionClient(connection, this.config.jsonColumns), connection);
         await connection.commit();
         return result;
       } catch (error) {
@@ -340,9 +365,9 @@ export class OracleDB {
       .filter(field => keySet.has(field.columnName))
       .map(field => `target.${field.columnSql} = :${field.bindName}`)
       .join(' AND ');
-    const updateClause = nonKeyFields.map(field => `target.${field.columnSql} = :${field.bindName}`).join(', ');
+    const updateClause = nonKeyFields.map(field => `target.${field.columnSql} = ${field.valueSql}`).join(', ');
     const insertColumns = fields.map(field => field.columnSql).join(', ');
-    const insertValues = fields.map(field => `:${field.bindName}`).join(', ');
+    const insertValues = fields.map(field => field.valueSql).join(', ');
     const matchedClause = updateClause ? ` WHEN MATCHED THEN UPDATE SET ${updateClause}` : '';
 
     // MERGE gives domains a consistent upsert primitive without exposing Oracle-specific SQL at call sites.
@@ -475,7 +500,7 @@ const QUOTED_IDENTIFIER = /^"([A-Za-z][A-Za-z0-9_]*)"$/;
 const ORDERED_COLUMN = /^(.*?)(?:\s+(ASC|DESC))?$/i;
 const UNSAFE_SQL =
   /;|--|\/\*|\*\/|\0|\b(CREATE|ALTER|DROP|TRUNCATE|INSERT|UPDATE|DELETE|MERGE|GRANT|REVOKE|COMMIT|ROLLBACK|EXECUTE|BEGIN|END)\b/i;
-const RESERVED_COLUMN_NAMES = new Set(['references', 'size']);
+const RESERVED_COLUMN_NAMES = new Set(['references', 'size', 'comment', 'when', 'key']);
 const LONG_TEXT_COLUMNS = new Set([
   'activeObservations',
   'activeObservationsPendingUpdate',
@@ -657,7 +682,7 @@ async function executeInsert(
 
   await client.none(
     `INSERT INTO ${tableSql} (${fields.map(field => field.columnSql).join(', ')}) VALUES (${fields
-      .map(field => `:${field.bindName}`)
+      .map(field => field.valueSql)
       .join(', ')})`,
     bindsFromFields(fields),
   );
@@ -675,7 +700,7 @@ async function executeUpdate(
   if (fields.length === 0) return;
 
   const { sql, binds } = whereFromKeys(keys, 'k');
-  const assignments = fields.map(field => `${field.columnSql} = :${field.bindName}`).join(', ');
+  const assignments = fields.map(field => `${field.columnSql} = ${field.valueSql}`).join(', ');
   await client.none(`UPDATE ${tableSql} SET ${assignments} WHERE ${sql}`, { ...binds, ...bindsFromFields(fields) });
 }
 
@@ -690,10 +715,16 @@ function prepareRecord(
     .filter(([, value]) => value !== undefined)
     .map(([columnName, value], index) => {
       const column = schema[columnName];
+      const bindName = `${bindPrefix}${index}`;
       return {
         columnName,
         columnSql: formatColumnName(columnName),
-        bindName: `${bindPrefix}${index}`,
+        bindName,
+        // Empty CLOB binds become SQL NULL. Keep an explicitly empty text value distinct from an absent value.
+        valueSql:
+          column?.type === 'text' && isLongTextColumn(tableName, columnName) && value === ''
+            ? `NVL(:${bindName}, EMPTY_CLOB())`
+            : `:${bindName}`,
         value: prepareValue(tableName, columnName, value, column),
       };
     });
@@ -730,7 +761,8 @@ function prepareValue(tableName: TABLE_NAMES, columnName: string, value: unknown
   }
 
   if (value === null) return null;
-  if (value instanceof Date) return value;
+  // Mastra timestamps represent instants. A naive bind is reinterpreted in the Oracle session timezone.
+  if (value instanceof Date) return { type: oracledb.DB_TYPE_TIMESTAMP_TZ, val: value };
   if (column?.type === 'boolean') return value ? 1 : 0;
   if (column?.type === 'text' && isLongTextColumn(tableName, columnName)) return clobBind(String(value));
   if (typeof value === 'object') return safeJsonStringify(value);
@@ -773,6 +805,16 @@ function isIdentifierLikeColumn(columnName: string): boolean {
 }
 
 function isLongTextColumn(tableName: TABLE_NAMES | string, columnName: string): boolean {
+  if (
+    (tableName === TABLE_EXPERIMENTS && columnName === 'name') ||
+    (tableName === TABLE_EXPERIMENT_RESULTS && columnName === 'comment')
+  )
+    return true;
+  if (tableName === TABLE_NOTIFICATIONS && ['summary', 'deliveryReason', 'lastDeliveryError'].includes(columnName))
+    return true;
+  if ((tableName === TABLE_CHANNEL_INSTALLATIONS || tableName === TABLE_SCHEDULE_TRIGGERS) && columnName === 'error')
+    return true;
+  if (tableName === TABLE_TOOL_PROVIDER_CONNECTIONS && columnName === 'label') return true;
   if (tableName === TABLE_THREADS && columnName === 'title') return false;
   return LONG_TEXT_COLUMNS.has(columnName);
 }

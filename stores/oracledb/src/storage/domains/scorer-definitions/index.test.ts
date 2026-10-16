@@ -15,7 +15,7 @@ describe('ScorerDefinitionsOracle pagination tie-breaker', () => {
       capturedSql = sql;
       return [];
     });
-    (scorerDefinitions as any).db = { oneOrNone, manyOrNone };
+    (scorerDefinitions as any).db = { read: { oneOrNone, manyOrNone } };
 
     await scorerDefinitions.list();
 
@@ -30,7 +30,7 @@ describe('ScorerDefinitionsOracle pagination tie-breaker', () => {
       capturedSql = sql;
       return [];
     });
-    (scorerDefinitions as any).db = { oneOrNone, manyOrNone };
+    (scorerDefinitions as any).db = { read: { oneOrNone, manyOrNone } };
 
     await scorerDefinitions.listVersions({ scorerDefinitionId: 'scorer-1' });
 

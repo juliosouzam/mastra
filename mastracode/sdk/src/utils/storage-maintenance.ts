@@ -76,7 +76,7 @@ export interface ReclaimResult {
 
 /** Handle the TUI uses to run storage maintenance without reaching into store internals. */
 export interface StorageMaintenance {
-  backend: 'libsql' | 'pg';
+  backend: 'libsql' | 'pg' | 'oracle';
   /** Retention policies in effect (for display in /prune output). */
   retention: RetentionConfig;
   /** Delete rows older than the retention policies. Safe to re-run; batched and cancellable. `options.retention` replaces the standing policies for this call only. */
@@ -348,10 +348,10 @@ function fileUrlToPath(url: string): string | undefined {
 
 /**
  * Resolve the local libsql db files eligible for checkpoint + VACUUM.
- * Returns [] for remote (turso) urls and PG backends. When PG was requested
+ * Returns [] for remote (turso) urls and PG/Oracle backends. When PG was requested
  * but the factory fell back to libsql, the fallback uses the default files.
  */
-export function resolveLocalDbFiles(config: StorageConfig, effectiveBackend: 'libsql' | 'pg'): string[] {
+export function resolveLocalDbFiles(config: StorageConfig, effectiveBackend: 'libsql' | 'pg' | 'oracle'): string[] {
   if (effectiveBackend !== 'libsql') return [];
   if (config.backend === 'pg') {
     // PG requested but fell back to the default local libsql files
@@ -369,11 +369,11 @@ export function resolveLocalDbFiles(config: StorageConfig, effectiveBackend: 'li
 /**
  * Build the maintenance handle for the effective storage backend.
  * `localDbFiles` are the local libsql file paths eligible for VACUUM;
- * pass an empty array for remote (turso) or PG backends.
+ * pass an empty array for remote (turso), PG, or Oracle backends.
  */
 export function createStorageMaintenance(opts: {
   storage: MastraCompositeStore;
-  backend: 'libsql' | 'pg';
+  backend: 'libsql' | 'pg' | 'oracle';
   retention: RetentionConfig;
   localDbFiles: string[];
   /** Closes the vector store's connection; required for local libsql so the compaction swap isn't blocked by our own handle. */

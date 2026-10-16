@@ -136,7 +136,7 @@ export type MastraCodePluginRuntime = {
    */
   getStorage?: () => {
     storage: MastraCompositeStore;
-    storageBackend: 'libsql' | 'pg';
+    storageBackend: 'libsql' | 'pg' | 'oracle';
     vector?: MastraVector;
   };
 };

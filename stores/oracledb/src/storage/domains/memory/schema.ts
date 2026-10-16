@@ -312,6 +312,9 @@ function indexName(name: string): string {
 
 function defaultIndexes(_ctx: MemoryContext): OracleCreateIndexOptions[] {
   return [
+    { name: indexName('MASTRA_THREADS_RETENTION_IDX'), table: TABLE_THREADS, columns: ['createdAt'] },
+    { name: indexName('MASTRA_MESSAGES_RETENTION_IDX'), table: TABLE_MESSAGES, columns: ['createdAt'] },
+    { name: indexName('MASTRA_RESOURCES_RETENTION_IDX'), table: TABLE_RESOURCES, columns: ['createdAt'] },
     {
       name: indexName('MASTRA_THREADS_RESOURCE_CREATED_IDX'),
       table: TABLE_THREADS,

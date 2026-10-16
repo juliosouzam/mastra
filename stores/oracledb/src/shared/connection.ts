@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import oracledb from 'oracledb';
 import type { Connection, Pool, PoolAttributes } from 'oracledb';
 
@@ -59,6 +60,16 @@ export class OraclePoolManager {
     }
   }
 
+  /** A conservative, credential-free identity for Knowledge backend registration. */
+  getStorageIsolationKey(schemaName?: string): string {
+    const target = this.config.pool ? undefined : this.config.connectString?.trim();
+    const easyConnect = target?.match(/^(?:tcp:\/\/|\/\/)?([^:/?]+)(?::(\d+))?\/([^?]+)$/i);
+    const owner = schemaName ?? this.config.user;
+    if (!easyConnect || !owner) return `oracle:unidentified:schema:${schemaName ?? 'current'}`;
+    const physicalTarget = `${easyConnect[1]!.toLowerCase()}:${easyConnect[2] ?? '1521'}/${easyConnect[3]}`;
+    return `oracle:${createHash('sha256').update(physicalTarget).digest('hex')}:schema:${owner.toUpperCase()}`;
+  }
+
   async close(): Promise<void> {
     if (this.ownsPool && this.poolPromise) {
       const poolPromise = this.poolPromise;
@@ -108,12 +119,37 @@ export function buildPoolOptions(config: OracleConnectionConfig): PoolAttributes
   return options;
 }
 
-export function executeOptions(): oracledb.ExecuteOptions {
-  return {
+export function executeOptions(jsonColumns: readonly string[] = []): oracledb.ExecuteOptions {
+  const options: oracledb.ExecuteOptions = {
     outFormat: oracledb.OUT_FORMAT_OBJECT,
     // Mastra stores several rich text fields as CLOBs; fetch them as strings to keep domain mappers simple.
     fetchInfo: {
       content: { type: oracledb.STRING as unknown as number },
+      label: { type: oracledb.STRING as unknown as number },
+      errorText: { type: oracledb.STRING as unknown as number },
+      notificationSummary: { type: oracledb.STRING as unknown as number },
+      notificationReason: { type: oracledb.STRING as unknown as number },
+      notificationError: { type: oracledb.STRING as unknown as number },
+      metadataJson: { type: oracledb.STRING as unknown as number },
+      inputJson: { type: oracledb.STRING as unknown as number },
+      groundTruthJson: { type: oracledb.STRING as unknown as number },
+      expectedTrajectoryJson: { type: oracledb.STRING as unknown as number },
+      inputSchemaJson: { type: oracledb.STRING as unknown as number },
+      groundTruthSchemaJson: { type: oracledb.STRING as unknown as number },
+      requestContextSchemaJson: { type: oracledb.STRING as unknown as number },
+      tagsJson: { type: oracledb.STRING as unknown as number },
+      targetIdsJson: { type: oracledb.STRING as unknown as number },
+      scorerIdsJson: { type: oracledb.STRING as unknown as number },
+      requestContextJson: { type: oracledb.STRING as unknown as number },
+      sourceJson: { type: oracledb.STRING as unknown as number },
+      toolMocksJson: { type: oracledb.STRING as unknown as number },
+      outputJson: { type: oracledb.STRING as unknown as number },
+      errorJson: { type: oracledb.STRING as unknown as number },
+      toolMockReportJson: { type: oracledb.STRING as unknown as number },
+      provenanceJson: { type: oracledb.STRING as unknown as number },
+      runnerAttestationJson: { type: oracledb.STRING as unknown as number },
+      experimentName: { type: oracledb.STRING as unknown as number },
+      experimentComment: { type: oracledb.STRING as unknown as number },
       instructions: { type: oracledb.STRING as unknown as number },
       description: { type: oracledb.STRING as unknown as number },
       changeMessage: { type: oracledb.STRING as unknown as number },
@@ -133,6 +169,17 @@ export function executeOptions(): oracledb.ExecuteOptions {
       reasonPrompt: { type: oracledb.STRING as unknown as number },
     },
   };
+  if (jsonColumns.length) {
+    // A fetch handler takes precedence over fetchInfo. Preserve the existing
+    // text aliases while opting only domain-owned JSON projections into CLOB fetching.
+    options.fetchTypeHandler = metadata =>
+      metadata.dbType === oracledb.DB_TYPE_CLOB &&
+      (jsonColumns.includes(String(metadata.name)) ||
+        options.fetchInfo?.[String(metadata.name)]?.type === oracledb.STRING)
+        ? { type: oracledb.STRING }
+        : undefined;
+  }
+  return options;
 }
 
 export function rows<T extends ObjectRow = ObjectRow>(result: oracledb.Result<T>): T[] {
@@ -140,7 +187,13 @@ export function rows<T extends ObjectRow = ObjectRow>(result: oracledb.Result<T>
 }
 
 export function asBindParameters(binds: Record<string, unknown>): BindParameters {
-  return binds as BindParameters;
+  // Raw JavaScript Dates represent instants, including in comparisons. Explicit caller bind types remain intact.
+  return Object.fromEntries(
+    Object.entries(binds).map(([key, value]) => [
+      key,
+      value instanceof Date ? { type: oracledb.DB_TYPE_TIMESTAMP_TZ, val: value } : value,
+    ]),
+  ) as BindParameters;
 }
 
 export function jsonBind(value: unknown): oracledb.BindParameter {
@@ -150,7 +203,11 @@ export function jsonBind(value: unknown): oracledb.BindParameter {
   // not implement, so DBeaver/DataGrip/SQL Developer fail to render the rows
   // with UnsupportedOperationException in OsonHeader. The column type stays
   // native JSON; only the text->OSON encoding moves server-side.
-  return { type: oracledb.DB_TYPE_VARCHAR, val: jsonBindText(value ?? null) };
+  const text = jsonBindText(value ?? null);
+  return {
+    type: text !== null && Buffer.byteLength(text) > 4000 ? oracledb.DB_TYPE_CLOB : oracledb.DB_TYPE_VARCHAR,
+    val: text,
+  };
 }
 
 export function jsonBindText(value: unknown): string | null {
@@ -208,7 +265,7 @@ export function safeJsonStringify(value: unknown): string {
         return candidate.map(item => sanitize(item));
       }
 
-      const result: Record<string, unknown> = {};
+      const result: Record<string, unknown> = Object.create(null);
       for (const key of keys) {
         const sanitized = sanitize((candidate as Record<string, unknown>)[key]);
         if (sanitized !== undefined) result[key] = sanitized;
