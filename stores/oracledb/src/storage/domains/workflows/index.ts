@@ -31,7 +31,7 @@ import type {
 } from '@mastra/core/storage';
 import type { StepResult, WorkflowRunState } from '@mastra/core/workflows';
 
-import { isOracleErrorCode, jsonBind } from '../../../shared/connection';
+import { jsonBind } from '../../../shared/connection';
 import { indexNameForTable, qualifyName } from '../../../vector/identifiers';
 import { OracleDB, createOracleIndex, filterIndexesForTables } from '../../db';
 import type { OracleCreateIndexOptions, OracleTxClient } from '../../db';
@@ -268,13 +268,13 @@ export class WorkflowsOracle extends WorkflowsStorage {
     try {
       return await this.db.tx(async client => {
         if (fence) await assertRunFence(client, this.runOwnersTable(), fence, 'updateWorkflowResults');
-        await this.ensureWorkflowRunRow(client, workflowName, runId);
-
         // Lock the row before patching the JSON snapshot so concurrent step updates do not overwrite each other.
-        const existing = await client.one<{ snapshot: unknown; resourceId?: string | null }>(
+        const existing = await client.oneOrNone<{ snapshot: unknown; resourceId?: string | null }>(
           `SELECT snapshot AS "snapshot", ${WORKFLOW_RESOURCE_ID} AS "resourceId" FROM ${this.table()} WHERE workflow_name = :workflowName AND run_id = :runId FOR UPDATE`,
           { workflowName, runId },
         );
+        // A result arriving after deletion must not recreate the workflow run.
+        if (!existing) return {};
 
         const snapshot = parseSnapshot(existing.snapshot);
         snapshot.context[stepId] = result;
@@ -315,8 +315,7 @@ export class WorkflowsOracle extends WorkflowsStorage {
     try {
       return await this.db.tx(async client => {
         if (fence) await assertRunFence(client, this.runOwnersTable(), fence, 'updateWorkflowState');
-        // State updates patch top-level snapshot fields and require a pre-existing
-        // run row; result updates create a default row when needed.
+        // State updates patch top-level snapshot fields and require a pre-existing run row.
         const existing = await client.oneOrNone<{ snapshot: unknown }>(
           `SELECT snapshot AS "snapshot" FROM ${this.table()} WHERE workflow_name = :workflowName AND run_id = :runId FOR UPDATE`,
           { workflowName, runId },
@@ -594,41 +593,6 @@ export class WorkflowsOracle extends WorkflowsStorage {
       )`;
   }
 
-  private async ensureWorkflowRunRow(client: OracleTxClient, workflowName: string, runId: string): Promise<void> {
-    const now = new Date();
-    try {
-      // Step-result updates may arrive before a full snapshot is persisted.
-      // Seed a minimal row so JSON patching always has a target.
-      await client.none(
-        `INSERT INTO ${this.table()} (
-          workflow_name,
-          run_id,
-          ${WORKFLOW_RESOURCE_ID},
-          snapshot,
-          ${WORKFLOW_CREATED_AT},
-          ${WORKFLOW_UPDATED_AT}
-        ) VALUES (
-          :workflowName,
-          :runId,
-          :resourceId,
-          :snapshot,
-          :createdAt,
-          :updatedAt
-        )`,
-        {
-          workflowName,
-          runId,
-          resourceId: null,
-          snapshot: jsonBind(createDefaultSnapshot(runId)),
-          createdAt: now,
-          updatedAt: now,
-        },
-      );
-    } catch (error) {
-      if (!isOracleErrorCode(error, [-1])) throw error;
-    }
-  }
-
   private workflowWhereClause(args: {
     workflowName?: string;
     fromDate?: Date;
@@ -704,23 +668,6 @@ export class WorkflowsOracle extends WorkflowsStorage {
   ) {
     return createOracleStorageError({ storeName: STORE_NAME, operation, reason, details, cause, category });
   }
-}
-
-function createDefaultSnapshot(runId: string): WorkflowRunState {
-  return {
-    context: {},
-    activePaths: [],
-    timestamp: Date.now(),
-    suspendedPaths: {},
-    activeStepsPath: {},
-    resumeLabels: {},
-    serializedStepGraph: [],
-    status: 'pending',
-    value: {},
-    waitingPaths: {},
-    runId,
-    requestContext: {},
-  } as WorkflowRunState;
 }
 
 function parseSnapshot(value: unknown): WorkflowRunState {

@@ -50,7 +50,7 @@ export type TestCapabilities = {
   /**
    * Whether late workflow-result writes preserve a deleted run. Concurrent adapters default to true;
    * adapters pending alignment under COR-1448 set this to false. Pending adapters are Convex, DSQL,
-   * DynamoDB, Elasticsearch, MongoDB, MSSQL, MySQL, OracleDB, Redis, Spanner, Upstash, and Valkey.
+   * DynamoDB, Elasticsearch, MongoDB, MSSQL, MySQL, Redis, Spanner, Upstash, and Valkey.
    */
   workflowResultsNoopWhenRunMissing?: boolean;
   /**

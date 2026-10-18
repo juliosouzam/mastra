@@ -292,6 +292,8 @@ const vector = new OracleVector({
 
 JSON metadata, payloads, and snapshots are stored in native Oracle JSON columns and encoded server-side, so the rows are readable directly with standard Oracle JDBC tools such as DBeaver and SQL Developer.
 
+Workflow step-result updates require an existing run. After you delete a workflow run, late step results leave it deleted. Use `persistWorkflowSnapshot()` to create a run explicitly. Updates to existing runs keep their row locks so concurrent step results preserve each other's changes.
+
 ## Usage example
 
 ### Adding OracleDB memory to an agent
