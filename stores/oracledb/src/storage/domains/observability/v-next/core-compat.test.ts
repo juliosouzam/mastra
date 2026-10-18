@@ -2,7 +2,7 @@ import { lightSpanRecordSchema, parseTraceQueryRequest, planTraceQuery } from '@
 import { describe, expect, it, vi } from 'vitest';
 import { makeSpan } from '../../../../../../_test-utils/src/domains/observability-vnext/data';
 import type { OracleObservabilityClient } from './client';
-import { rowToLightTraceRecord, spanRecordToRow } from './helpers';
+import { rowToLightTraceRecord, rowToSpanRecord, spanRecordToRow } from './helpers';
 import { queryTraces } from './trace-query';
 
 vi.mock('@mastra/core/storage', async importOriginal => {
@@ -14,6 +14,7 @@ vi.mock('@mastra/core/storage', async importOriginal => {
     buildStoredPreview: undefined,
     traceQueryTraceSchema: trace,
     lightSpanRecordSchema: core.lightSpanRecordSchema.omit({ outputPreview: true, errorPreview: true }),
+    spanRecordSchema: core.spanRecordSchema.omit({ timeToFirstChunkMs: true }),
     traceQueryResponseSchema: core.traceQueryPaginatedTraceResponseSchema.extend({ traces: trace.array() }),
   };
 });
@@ -66,5 +67,11 @@ describe('Oracle observability with the Core 1.76 preview contract', () => {
     const record = rowToLightTraceRecord(row());
     expect(record.inputPreview).toBe('compat question');
     expect(lightSpanRecordSchema.strict().parse(record)).toMatchObject({ traceId: span.traceId });
+  });
+
+  it('omits first-chunk timing from records when the installed Core schema predates it', () => {
+    const record = rowToSpanRecord({ ...row(), timeToFirstChunkMs: 250 });
+    expect(record).not.toHaveProperty('timeToFirstChunkMs');
+    expect(record.traceId).toBe(span.traceId);
   });
 });

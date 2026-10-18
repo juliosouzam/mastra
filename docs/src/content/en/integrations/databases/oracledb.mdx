@@ -273,6 +273,8 @@ Use `disableInit: true` when schema changes are applied by a separate deployment
 
 Use `OracleStoreVNext` for metrics, feedback, span and trace queries, trace aggregates, thread queries, previews, and delta polling. It replaces the observability domain while keeping the same application storage domains. `OracleStore` retains its existing observability behavior.
 
+Span queries support Core's identity, execution-context, and parent/root entity filters. Span records preserve `timeToFirstChunkMs` supplied by Core, including zero. Initialization adds this nullable column to existing span tables and preserves their spans.
+
 Provide an explicit observability connection. Use a dedicated database for observability when its writes and aggregate queries would compete with application traffic:
 
 ```ts

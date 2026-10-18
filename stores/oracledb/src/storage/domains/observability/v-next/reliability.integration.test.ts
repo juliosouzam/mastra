@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { makeSpan } from '../../../../../../_test-utils/src/domains/observability-vnext/data';
 import { OraclePoolManager } from '../../../../shared/connection';
 import { OracleObservabilityClient } from './client';
+import { TABLE_SPAN_EVENTS } from './ddl';
 import { runWithOracleTraceQueryTimeout } from './trace-query';
 import { ObservabilityStorageOracleVNext } from '.';
 
@@ -27,6 +28,26 @@ describe.runIf(process.env.RUN_ORACLE_STORAGE_INTEGRATION === 'true')('Oracle ob
   afterAll(async () => {
     await storage?.dangerouslyClearAll();
     await manager?.close();
+  });
+
+  it('adds the first-chunk column to existing tables without losing spans', async () => {
+    const span = makeSpan({ traceId: randomUUID(), spanId: randomUUID(), timeToFirstChunkMs: 250 });
+    await storage.createSpan({ span });
+    await client.none(`ALTER TABLE "${TABLE_SPAN_EVENTS}" DROP COLUMN "timeToFirstChunkMs"`);
+    try {
+      await Promise.all([storage.init(), storage.init()]);
+      expect((await storage.getSpan(span))?.span).toMatchObject({
+        traceId: span.traceId,
+        spanId: span.spanId,
+        timeToFirstChunkMs: null,
+      });
+      const streamed = { ...span, traceId: randomUUID(), timeToFirstChunkMs: 0 };
+      await storage.createSpan({ span: streamed });
+      await storage.init();
+      expect((await storage.getSpan(streamed))?.span.timeToFirstChunkMs).toBe(0);
+    } finally {
+      await storage.init();
+    }
   });
 
   it('cancels a slow Oracle statement and restores the pooled connection timeout', async () => {

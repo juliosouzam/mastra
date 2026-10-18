@@ -56,5 +56,27 @@ export function readPreview(preview: unknown, payload?: unknown, jsonEncoded = f
 
 /** Core owns response fields and truncation rules for its installed version. */
 export function buildSpanQueryResponse(...args: Parameters<typeof coreStorage.buildSpanQueryResponse>) {
-  return coreStorage.buildSpanQueryResponse(...args);
+  const [plan, selected, payloads, metrics = []] = args;
+  // Older Core schemas reject the context fields added to current span responses.
+  const compatibleSelected = coreStorage.SPAN_QUERY_FIELD_REGISTRY
+    ? selected
+    : (selected.map(row => ({
+        organizationId: row.organizationId,
+        resourceId: row.resourceId,
+        traceId: row.traceId,
+        spanId: row.spanId,
+        parentSpanId: row.parentSpanId,
+        name: row.name,
+        spanType: row.spanType,
+        status: row.status,
+        startedAt: row.startedAt,
+        endedAt: row.endedAt,
+        durationMs: row.durationMs,
+        entityType: row.entityType,
+        entityId: row.entityId,
+        entityName: row.entityName,
+        model: row.model,
+        provider: row.provider,
+      })) as typeof selected);
+  return coreStorage.buildSpanQueryResponse(plan, compatibleSelected, payloads, metrics);
 }

@@ -201,7 +201,9 @@ export class ObservabilityStorageOracleVNext extends ObservabilityStorage {
     for (const tableName of [TABLE_SPAN_EVENTS, TABLE_FEEDBACK_EVENTS] as const)
       for (const column of SIGNAL_COLUMNS[tableName]) {
         if (
-          !['textSearch', 'inputPreview', 'outputPreview', 'errorPreview'].includes(column.name) ||
+          !['textSearch', 'inputPreview', 'outputPreview', 'errorPreview', 'timeToFirstChunkMs'].includes(
+            column.name,
+          ) ||
           (await this.db.hasColumn(tableName, column.name))
         )
           continue;
@@ -254,6 +256,7 @@ export class ObservabilityStorageOracleVNext extends ObservabilityStorage {
       'trace-query',
       'trace-aggregate',
       'span-query',
+      'span-query-context-fields',
       'trace-query-root-duration',
       'trace-query-discovery',
       'thread-query',

@@ -83,6 +83,7 @@ export const SPAN_EVENT_COLUMNS = [
   { name: 'isPending', type: 'boolean' },
   { name: 'startedAt', type: 'timestamp' },
   { name: 'endedAt', type: 'timestamp' },
+  { name: 'timeToFirstChunkMs', type: 'float', nullable: true },
   { name: 'tags', type: 'text[]' },
   { name: 'metadataSearch', type: 'jsonb' },
   { name: 'attributes', type: 'jsonb', nullable: true },

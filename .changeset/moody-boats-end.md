@@ -18,6 +18,8 @@ Added `OracleFactoryStorage` for application collections, atomic updates, transa
 
 Added `OracleStoreVNext` for advanced observability on an explicit Oracle connection: metrics, feedback, trace/span/thread queries, aggregates, previews, commit-aware polling, and bounded retention. The observability user needs `EXECUTE ON SYS.DBMS_FLASHBACK`. Existing `OracleStore` behavior and tables remain available.
 
+Span queries support Core's context and lineage filters while preserving older supported response contracts. Span events store time to first chunk, and initialization adds the field to existing tables without losing spans.
+
 Added optional `readPool` / `readPoolManager` routing. Mutations, schema initialization, and lifecycle decisions use the writer even when the replica lags. Workflow run lookups, notification delivery checks, and running-task counts use committed writer state to prevent snapshot resets, repeated signals, and dispatch beyond concurrency limits.
 
 Preserved large JSON values and authored keys through memory, configuration, and vector reads. Concurrent startup now reconciles migration records and publishes the Knowledge initialization marker atomically. Advanced query responses follow the installed Core preview schema, including Core 1.76, and consistent reads work immediately after schema creation.

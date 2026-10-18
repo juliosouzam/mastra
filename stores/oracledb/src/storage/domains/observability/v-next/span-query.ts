@@ -21,11 +21,23 @@ const fields = [
   'entityId',
   'entityName',
   'entityVersionId',
+  'parentEntityType',
+  'parentEntityId',
+  'parentEntityName',
   'parentEntityVersionId',
+  'rootEntityType',
+  'rootEntityId',
+  'rootEntityName',
   'rootEntityVersionId',
+  'threadId',
   'runId',
   'sessionId',
   'userId',
+  'requestId',
+  'serviceName',
+  'experimentId',
+  'environment',
+  'executionSource',
 ];
 const identities = identityFields.map(field => `"${field}"`).join(', ');
 const identityOrder = identityFields.map(field => `"${field}" COLLATE BINARY ASC NULLS LAST`).join(', ');
@@ -89,19 +101,24 @@ export function compileOracleSpanQuery(schema: string, plan: TrustedSpanQueryPla
   const sameIdentity = identityFields
     .map(field => `(e."${field}" = c."${field}" OR (e."${field}" IS NULL AND c."${field}" IS NULL))`)
     .join(' AND ');
+  // Older Core planners still permit model/provider predicates. Current Core hydrates
+  // these attributes only for the selected page, as PostgreSQL does.
+  const legacyModelFields = coreStorage.SPAN_QUERY_FIELD_REGISTRY
+    ? ''
+    : `CASE WHEN JSON_EXISTS("attributes", '$.model?(@.type() == "string")') THEN JSON_VALUE("attributes", '$.model' RETURNING VARCHAR2(32767) NULL ON ERROR) END AS "model",
+      CASE WHEN JSON_EXISTS("attributes", '$.provider?(@.type() == "string")') THEN JSON_VALUE("attributes", '$.provider' RETURNING VARCHAR2(32767) NULL ON ERROR) END AS "provider",`;
   const text = `WITH candidate_ids AS (
     SELECT DISTINCT ${identities} FROM ${table} WHERE "startedAt" >= :p1 AND "startedAt" < :p2 AND "endedAt" >= :p1 AND "isPending" = 0 ${scope.length ? `AND ${scope.join(' AND ')}` : ''}
   ), current_spans AS (
     SELECT * FROM (SELECT ${fields.map(field => `"${field}"`).join(', ')}, "textSearch", "startedAt", "endedAt", TO_CHAR("cursorId") AS "version",
-      CASE WHEN JSON_EXISTS("attributes", '$.model?(@.type() == "string")') THEN JSON_VALUE("attributes", '$.model' RETURNING VARCHAR2(32767) NULL ON ERROR) END AS "model",
-      CASE WHEN JSON_EXISTS("attributes", '$.provider?(@.type() == "string")') THEN JSON_VALUE("attributes", '$.provider' RETURNING VARCHAR2(32767) NULL ON ERROR) END AS "provider",
+      ${legacyModelFields}
       ${durationMsSql('"startedAt"', '"endedAt"')} AS "durationMs",
       CASE WHEN "error" IS NULL THEN 'success' ELSE 'error' END AS "status",
       CASE WHEN "error" IS NULL THEN 0 ELSE 1 END AS "hasError",
       ROW_NUMBER() OVER (PARTITION BY ${identities} ORDER BY "endedAt" DESC, "cursorId" DESC) AS "spanRank"
     FROM ${table} e WHERE "isPending" = 0 AND "endedAt" >= :p1 AND EXISTS (SELECT 1 FROM candidate_ids c WHERE ${sameIdentity}) ${scope.length ? `AND ${scope.join(' AND ')}` : ''}) WHERE "spanRank" = 1
   ), candidates AS (SELECT current_spans.*, CASE WHEN "hasError" = 1 THEN 'error' ELSE NULL END AS "error" FROM current_spans)
-  SELECT ${[...identityFields, 'parentSpanId', 'name', 'spanType', 'entityType', 'entityId', 'entityName', 'model', 'provider', 'startedAt', 'endedAt', 'durationMs', 'status', 'version'].map(field => `s."${field}"`).join(', ')}
+  SELECT ${[...fields, 'startedAt', 'endedAt', 'durationMs', 'status', 'version'].map(field => `s."${field}"`).join(', ')}
   FROM candidates s WHERE s."startedAt" >= :p1 AND s."startedAt" < :p2 AND (${predicate.sql}) AND ${after}
   ORDER BY s."${plan.orderBy.field}" ${plan.orderBy.direction === 'asc' ? 'ASC' : 'DESC'}, ${identityOrder}
   FETCH FIRST :p${values.length} ROWS ONLY`;
@@ -135,7 +152,7 @@ function toSpanQueryPayload(row: Record<string, unknown>): SpanQueryPayload {
   };
 }
 
-type Selected = Omit<SpanQuerySelectedRow, 'startedAt' | 'endedAt'> & {
+type Selected = Omit<SpanQuerySelectedRow, 'startedAt' | 'endedAt' | 'model' | 'provider'> & {
   startedAt: Date;
   endedAt: Date;
   version: string;
@@ -155,7 +172,7 @@ export async function querySpans(client: DbClient, schema: string, plan: Trusted
         endedAt: endedAt.toISOString(),
       }));
       const page = rows.slice(0, plan.limit);
-      if (!page.length) return coreStorage.buildSpanQueryResponse(plan, selected, [], []);
+      if (!page.length) return buildSpanQueryResponse(plan, [], []);
       const remaining = async () => {
         const ms = Math.floor(deadline - performance.now());
         if (ms <= 0) throw new coreStorage.TraceQueryExecutionError();
@@ -172,30 +189,44 @@ export async function querySpans(client: DbClient, schema: string, plan: Trusted
         .join(' OR ');
       // Stored previews, plus the payload only where its preview is NULL (a row written before the
       // preview columns existed), so new rows never read their payloads here.
-      const payloadRows = await tx.any<Record<string, unknown>>(
+      const payloadRows = await tx.any<
+        SpanQueryIdentity & Record<string, unknown> & { model: string | null; provider: string | null }
+      >(
         `SELECT ${identities},
+      CASE WHEN JSON_EXISTS("attributes", '$.model?(@.type() == "string")') THEN JSON_VALUE("attributes", '$.model' RETURNING VARCHAR2(32767) NULL ON ERROR) END AS "model",
+      CASE WHEN JSON_EXISTS("attributes", '$.provider?(@.type() == "string")') THEN JSON_VALUE("attributes", '$.provider' RETURNING VARCHAR2(32767) NULL ON ERROR) END AS "provider",
       ${PREVIEW_PAYLOADS.map(([preview, payload]) => `"${preview}", JSON_SERIALIZE(CASE WHEN ${missingPreviewSql(`"${preview}"`)} THEN "${payload}" END RETURNING CLOB) AS "${payload}"`).join(',\n      ')}
       FROM ${qualifiedTable(schema, TABLE_SPAN_EVENTS)} WHERE ${payloadWhere}`,
         payloadValues,
       );
       const payloads = payloadRows.map(toSpanQueryPayload);
-      await remaining();
-      const metricValues: unknown[] = [];
-      const metricWhere = selectedKeys(page, metricValues);
-      const metricRows = await tx.any<SpanQueryCostMetric & Record<string, unknown>>(
-        `SELECT ${identities}, "name", "estimatedCost", "costUnit",
+      const metadata = new Map(payloadRows.map(row => [coreStorage.spanQueryIdentityKey(row), row]));
+      const hydrated = selected.map(row => ({
+        ...row,
+        model: metadata.get(coreStorage.spanQueryIdentityKey(row))?.model ?? null,
+        provider: metadata.get(coreStorage.spanQueryIdentityKey(row))?.provider ?? null,
+      }));
+      // Keep the cost query only for older Core versions whose response contract requires it.
+      let metrics: SpanQueryCostMetric[] = [];
+      if (!coreStorage.SPAN_QUERY_FIELD_REGISTRY) {
+        await remaining();
+        const metricValues: unknown[] = [];
+        const metricWhere = selectedKeys(page, metricValues);
+        const metricRows = await tx.any<SpanQueryCostMetric & Record<string, unknown>>(
+          `SELECT ${identities}, "name", "estimatedCost", "costUnit",
         JSON_VALUE("costMetadata", '$.allocation' RETURNING VARCHAR2(32767) NULL ON ERROR) AS "allocation",
         CASE WHEN JSON_EXISTS("costMetadata", '$.error') THEN 1 ELSE 0 END AS "costError"
         FROM (SELECT ${identities}, "name", "estimatedCost", "costUnit", "costMetadata",
           ROW_NUMBER() OVER (PARTITION BY ${identities}, "metricId" ORDER BY "cursorId" DESC) AS "metricRank"
           FROM ${qualifiedTable(schema, TABLE_METRIC_EVENTS)} WHERE (${metricWhere}) AND "name" LIKE 'mastra_model_%') m
         WHERE "metricRank" = 1 FETCH FIRST ${coreStorage.SPAN_QUERY_MAX_COST_METRICS + 1} ROWS ONLY`,
-        metricValues,
-      );
-      const metrics = metricRows.map(row => ({ ...row, costError: Boolean(row.costError) }));
-      if (metrics.length > coreStorage.SPAN_QUERY_MAX_COST_METRICS)
-        throw new coreStorage.TraceQueryResourceLimitError();
-      return buildSpanQueryResponse(plan, selected, payloads, metrics);
+          metricValues,
+        );
+        metrics = metricRows.map(row => ({ ...row, costError: Boolean(row.costError) }));
+        if (metrics.length > coreStorage.SPAN_QUERY_MAX_COST_METRICS)
+          throw new coreStorage.TraceQueryResourceLimitError();
+      }
+      return buildSpanQueryResponse(plan, hydrated, payloads, metrics);
     },
     { repeatableRead: true },
   );

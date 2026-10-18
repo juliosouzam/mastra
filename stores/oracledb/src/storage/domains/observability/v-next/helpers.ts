@@ -17,7 +17,7 @@ import type {
   ScoreRecord,
   SpanRecord,
 } from '@mastra/core/storage';
-import { computeTraceStatus, EntityType, lightSpanRecordSchema } from '@mastra/core/storage';
+import { computeTraceStatus, EntityType, lightSpanRecordSchema, spanRecordSchema } from '@mastra/core/storage';
 import { storedPreview as buildStoredPreview, previewFieldsForSchema, readPreview } from './preview-compat';
 import { coerceFeedbackReviewStatus } from './review-status';
 import { encodeJsonbValue } from './sql';
@@ -264,6 +264,7 @@ export function spanRecordToRow(span: CreateSpanRecord): Record<string, unknown>
     isPending,
     startedAt: toIsoOrDate(span.startedAt),
     endedAt: toIsoOrDate(endedAt),
+    timeToFirstChunkMs: span.timeToFirstChunkMs ?? null,
     tags: normalizeTags(span.tags),
     metadataSearch: buildMetadataSearch(metadata as Record<string, unknown> | null),
     metadataRaw: jsonField(metadata),
@@ -308,6 +309,7 @@ export function rowToSpanRecord(row: Record<string, any>): SpanRecord {
     isEvent: Boolean(row.isEvent),
     startedAt,
     endedAt,
+    ...('timeToFirstChunkMs' in spanRecordSchema.shape ? { timeToFirstChunkMs: row.timeToFirstChunkMs ?? null } : {}),
     tags: normalizeTags(parsedJson(row.tags)),
     metadata: (parsedJson(row.metadataRaw) as Record<string, unknown> | null) ?? undefined,
     scope: (parsedJson(row.scope) as Record<string, unknown> | null) ?? undefined,

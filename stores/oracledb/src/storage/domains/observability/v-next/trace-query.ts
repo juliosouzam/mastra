@@ -88,6 +88,27 @@ const SPAN_FIELDS = {
   organizationId: 's."organizationId"',
 } satisfies FieldRegistry<TraceQuerySpanField>;
 
+// Direct span queries use Core's context-field policy; related trace predicates retain theirs.
+const SPAN_QUERY_FIELDS = {
+  ...SPAN_FIELDS,
+  traceId: 's."traceId"',
+  spanId: 's."spanId"',
+  parentSpanId: 's."parentSpanId"',
+  threadId: 's."threadId"',
+  resourceId: 's."resourceId"',
+  requestId: 's."requestId"',
+  serviceName: 's."serviceName"',
+  experimentId: 's."experimentId"',
+  environment: 's."environment"',
+  executionSource: 's."executionSource"',
+  parentEntityType: 's."parentEntityType"',
+  parentEntityId: 's."parentEntityId"',
+  parentEntityName: 's."parentEntityName"',
+  rootEntityType: 's."rootEntityType"',
+  rootEntityId: 's."rootEntityId"',
+  rootEntityName: 's."rootEntityName"',
+};
+
 const SCORE_FIELDS = {
   scorerId: 's."scorerId"',
   scorerVersion: 's."scorerVersion"',
@@ -1150,7 +1171,7 @@ export async function queryThreads(
   });
 }
 
-/** Compile a span-row filter with exactly the same rules as trace span predicates. */
+/** Compile a direct span query with its context-field mapping. */
 export function compileSpanQueryPredicate(predicate: TrustedTraceQueryScalarPredicate, offset: number): SqlFragment {
-  return compileScalarPredicate(predicate, SPAN_FIELDS, offset);
+  return compileScalarPredicate(predicate, SPAN_QUERY_FIELDS, offset);
 }
